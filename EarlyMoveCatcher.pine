@@ -1,87 +1,143 @@
 //@version=5
 // =============================================================================
-//  Early Move Catcher  -  "Ready to Fly" Pre-Breakout Signal
-//  Standalone indicator (do NOT merge with Institutional S/D Zones).
-//  Catches early moves on any script (stocks / index / FX / crypto) by
-//  detecting the rare moment when ALL of the following align:
-//      1. Volatility squeeze   (BB width inside Keltner -> coil)
-//      2. Range compression    (NR7 / inside-bar cluster)
-//      3. Volume dry-up then pop (accumulation / distribution print)
-//      4. Momentum loaded      (RSI mid-zone curling, MACD hist flip)
-//      5. Liquidity sweep ready (price pinned to a recent pivot edge)
-//  When all gates pass -> "BUY READY" / "SELL READY" tag is plotted.
-//  Side is inferred from where price is coiled relative to fast EMA & VWAP;
-//  if direction is ambiguous, a neutral "FLY READY" is shown.
+//  GEM Catcher Pro  -  NSE Intraday Early-Move Indicator
+//  Standalone, non-repainting, Pine Script v5
+//  Tuned for NSE cash & F&O stocks, NIFTY, BANKNIFTY on 3m / 5m / 15m
+//
+//  Edge stack (signal fires only when a weighted majority aligns):
+//    1. NSE session window filter (skip 09:15-09:30 noise & last 30 min)
+//    2. Anchored VWAP from session open + 1σ / 2σ bands
+//    3. 15-min Opening Range high/low + breakout confirmation
+//    4. Higher-Timeframe (15m default) EMA20 / EMA50 trend alignment
+//    5. Optional NIFTY index bias confirmation
+//    6. TTM-style volatility squeeze (BB inside Keltner) + release trigger
+//    7. NR-N / inside-bar range compression
+//    8. Relative Volume (RVOL >= 1.5x by default)
+//    9. Pivot Break-of-Structure (BOS) on swing high / low
+//   10. Trend-aligned EMA9 / EMA21 + RSI / MACD-hist filter
+//
+//  Outputs:
+//    • BUY GEM / SELL GEM labels with probability score
+//    • Auto trade plan: Entry, SL (ATR-based), T1 / T2 / T3 (R-multiples)
+//    • Dashboard table: bias, HTF, RVOL, ATR, scores, squeeze, window
+//    • Alerts (alertcondition + runtime alert)
 // =============================================================================
-indicator("Early Move Catcher [Ready to Fly]",
-     shorttitle="EarlyMove",
+indicator("GEM Catcher Pro [NSE Intraday]",
+     shorttitle="GEM Pro",
      overlay=true,
      max_labels_count=500,
-     max_lines_count=200,
-     max_boxes_count=200)
+     max_lines_count=500,
+     max_boxes_count=500)
 
-// -----------------------------------------------------------------------------
-//  INPUTS
-// -----------------------------------------------------------------------------
-grpCore   = "Core Engine"
-bbLen     = input.int(20,   "BB / Keltner Length",   minval=5,  group=grpCore)
-bbMult    = input.float(2.0,"BB Std-Dev Mult",       minval=0.5,step=0.1, group=grpCore)
-kcMult    = input.float(1.5,"Keltner ATR Mult",      minval=0.5,step=0.1, group=grpCore)
-nrLook    = input.int(7,    "NR-N Lookback",         minval=3,  group=grpCore)
-volLen    = input.int(20,   "Volume MA Length",      minval=5,  group=grpCore)
-dryMult   = input.float(0.8,"Volume Dry-up <= MA x", minval=0.1,step=0.05,group=grpCore)
-popMult   = input.float(1.4,"Volume Pop >= MA x",    minval=1.0,step=0.1, group=grpCore)
-rsiLen    = input.int(14,   "RSI Length",            minval=2,  group=grpCore)
-rsiLow    = input.int(40,   "RSI Lower Coil",        group=grpCore)
-rsiHigh   = input.int(60,   "RSI Upper Coil",        group=grpCore)
-pivLen    = input.int(10,   "Pivot Lookback",        minval=2,  group=grpCore)
-pinPct    = input.float(0.5,"Pin to Pivot (% of ATR)", minval=0.1,step=0.1, group=grpCore)
+// ─── INPUTS ────────────────────────────────────────────────────────────────
+gSes  = "Session (NSE / IST)"
+sessTrade = input.session("0930-1500", "Tradable Window",  group=gSes,
+     tooltip="Skips 09:15-09:30 opening volatility & last 30 min auction drift")
+sessOR    = input.session("0915-0930", "Opening Range",    group=gSes)
+sessFull  = input.session("0915-1525", "Full Session",     group=gSes)
+skipLunch = input.bool(false, "Skip Lunch (11:30-13:00)",  group=gSes)
+sessLunch = input.session("1130-1300","Lunch Window",      group=gSes)
 
-grpDir    = "Direction Bias"
-emaFast   = input.int(8,    "Fast EMA",              minval=2, group=grpDir)
-emaSlow   = input.int(21,   "Slow EMA",              minval=5, group=grpDir)
-useVwap   = input.bool(true,"Use VWAP for bias",     group=grpDir)
+gCore = "Detection Engine"
+bbLen   = input.int(20,   "BB / KC Length",      minval=5,  group=gCore)
+bbMult  = input.float(2.0,"BB Std-Dev",          minval=0.5,step=0.1, group=gCore)
+kcMult  = input.float(1.5,"KC ATR Mult",         minval=0.5,step=0.1, group=gCore)
+nrLook  = input.int(7,    "NR-N Lookback",       minval=3,  group=gCore)
+volLen  = input.int(20,   "Volume MA Length",    minval=5,  group=gCore)
+rvolMin = input.float(1.5,"Min Relative Volume", minval=0.5,step=0.1, group=gCore)
+atrLen  = input.int(14,   "ATR Length",          minval=5,  group=gCore)
+pivLen  = input.int(10,   "Swing Pivot",         minval=3,  group=gCore)
 
-grpVis    = "Visuals & Alerts"
-showSqz   = input.bool(true,"Highlight Squeeze Bars",   group=grpVis)
-showLbl   = input.bool(true,"Show Ready Labels",        group=grpVis)
-showProb  = input.bool(true,"Show Probability Score",   group=grpVis)
-alertOn   = input.bool(true,"Enable Alerts",            group=grpVis)
+gHTF  = "Higher-Timeframe Trend"
+useHTF  = input.bool(true,    "Require HTF Alignment",  group=gHTF)
+htfTF   = input.timeframe("15","HTF Timeframe",         group=gHTF)
+htfFast = input.int(20, "HTF Fast EMA", minval=5, group=gHTF)
+htfSlow = input.int(50, "HTF Slow EMA", minval=10,group=gHTF)
 
-// -----------------------------------------------------------------------------
-//  CORE CALCS
-// -----------------------------------------------------------------------------
-atr   = ta.atr(bbLen)
+gIdx = "Index Confirmation"
+useIdx = input.bool(false, "Confirm with Index Bias", group=gIdx)
+idxSym = input.symbol("NSE:NIFTY", "Index Symbol",    group=gIdx)
+
+gThr = "Probability Gate"
+minScore = input.int(75, "Min Score to Fire (0-100)", minval=50, maxval=100, group=gThr)
+cooldown = input.int(15, "Cooldown Bars Between Signals", minval=1, group=gThr)
+
+gRisk = "Risk / Trade Plan"
+riskAtr = input.float(1.2, "SL = ATR x", minval=0.3, step=0.1, group=gRisk)
+rr1     = input.float(1.0, "T1 R-Multiple", minval=0.5, step=0.1, group=gRisk)
+rr2     = input.float(2.0, "T2 R-Multiple", minval=0.5, step=0.1, group=gRisk)
+rr3     = input.float(3.0, "T3 R-Multiple", minval=0.5, step=0.1, group=gRisk)
+planLen = input.int(40, "Plan Lines Length (bars)", minval=10, group=gRisk)
+
+gVis = "Visuals"
+showVWAP = input.bool(true, "Anchored VWAP + Bands",     group=gVis)
+showOR   = input.bool(true, "Opening Range",             group=gVis)
+showPlan = input.bool(true, "Trade Plan (SL/T1/T2/T3)",  group=gVis)
+showDash = input.bool(true, "Dashboard",                 group=gVis)
+showSqz  = input.bool(true, "Highlight Squeeze",         group=gVis)
+showBias = input.bool(true, "Plot EMA9 / EMA21",         group=gVis)
+
+// ─── SESSION FLAGS ─────────────────────────────────────────────────────────
+tz       = "Asia/Kolkata"
+inFull   = not na(time(timeframe.period, sessFull,  tz))
+inOR     = not na(time(timeframe.period, sessOR,    tz))
+inTradeS = not na(time(timeframe.period, sessTrade, tz))
+inLunch  = not na(time(timeframe.period, sessLunch, tz))
+inTrade  = inTradeS and not (skipLunch and inLunch)
+
+newSession = ta.change(time("D")) != 0
+
+// ─── OPENING RANGE ─────────────────────────────────────────────────────────
+var float orH = na
+var float orL = na
+if newSession
+    orH := na
+    orL := na
+if inOR
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low  : math.min(orL, low)
+
+// ─── CORE INDICATORS ───────────────────────────────────────────────────────
+atr   = ta.atr(atrLen)
 basis = ta.sma(close, bbLen)
 dev   = ta.stdev(close, bbLen)
 bbU   = basis + bbMult * dev
 bbL   = basis - bbMult * dev
 kcU   = basis + kcMult * atr
 kcL   = basis - kcMult * atr
+squeeze = bbU < kcU and bbL > kcL
+sqzFire = squeeze[1] and not squeeze
 
-// 1. Squeeze: BB inside Keltner -> volatility coil
-squeeze = (bbU < kcU) and (bbL > kcL)
+rng    = high - low
+nrN    = rng <= ta.lowest(rng, nrLook)
+inside = high <= high[1] and low >= low[1]
+compr  = nrN or inside
 
-// 2. Range compression: NR-N (today's range smallest in N bars)
-rng     = high - low
-nrN     = rng <= ta.lowest(rng, nrLook)
-inside  = (high <= high[1]) and (low >= low[1])
-compr   = nrN or inside
+vMA      = ta.sma(volume, volLen)
+rvol     = volume / math.max(vMA, 1)
+volReady = rvol >= rvolMin
 
-// 3. Volume profile: dry-up over last few bars, then current/prev pop
-vMA       = ta.sma(volume, volLen)
-dryRecent = ta.sma(volume, 3) <= vMA * dryMult
-popNow    = volume >= vMA * popMult
-volReady  = dryRecent and popNow
+rsi = ta.rsi(close, 14)
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
 
-// 4. Momentum loaded: RSI in coil zone & turning, MACD hist flips toward zero
-rsi       = ta.rsi(close, rsiLen)
-rsiCoil   = rsi >= rsiLow and rsi <= rsiHigh
-[macd, sig, hist] = ta.macd(close, 12, 26, 9)
-histFlip  = (hist > hist[1] and hist[1] <= hist[2]) or (hist < hist[1] and hist[1] >= hist[2])
-momReady  = rsiCoil and histFlip
+// Anchored VWAP from session start with std-dev bands
+[vwap, vwU1, vwL1] = ta.vwap(hlc3, newSession, 1.0)
+[_v2, vwU2, vwL2] = ta.vwap(hlc3, newSession, 2.0)
 
-// 5. Liquidity / pin to pivot
+// HTF trend
+htfClose = request.security(syminfo.tickerid, htfTF, close,             lookahead=barmerge.lookahead_off)
+htfEmaF  = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfFast), lookahead=barmerge.lookahead_off)
+htfEmaS  = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfSlow), lookahead=barmerge.lookahead_off)
+htfUp = htfClose > htfEmaF and htfEmaF > htfEmaS
+htfDn = htfClose < htfEmaF and htfEmaF < htfEmaS
+
+// Index bias
+idxClose = request.security(idxSym, htfTF, close,                       lookahead=barmerge.lookahead_off)
+idxEmaF  = request.security(idxSym, htfTF, ta.ema(close, htfFast),      lookahead=barmerge.lookahead_off)
+idxUp = not useIdx or idxClose > idxEmaF
+idxDn = not useIdx or idxClose < idxEmaF
+
+// Pivot Break-of-Structure
 ph = ta.pivothigh(high, pivLen, pivLen)
 pl = ta.pivotlow(low,  pivLen, pivLen)
 var float lastPH = na
@@ -90,84 +146,180 @@ if not na(ph)
     lastPH := ph
 if not na(pl)
     lastPL := pl
-pinUp   = not na(lastPH) and math.abs(high - lastPH) <= atr * pinPct
-pinDn   = not na(lastPL) and math.abs(low  - lastPL) <= atr * pinPct
-pinned  = pinUp or pinDn
+bosUp = not na(lastPH) and close > lastPH and close[1] <= lastPH
+bosDn = not na(lastPL) and close < lastPL and close[1] >= lastPL
 
-// -----------------------------------------------------------------------------
-//  DIRECTION BIAS
-// -----------------------------------------------------------------------------
-ef = ta.ema(close, emaFast)
-es = ta.ema(close, emaSlow)
-vw = useVwap ? ta.vwap(hlc3) : basis
+// Short EMA bias
+emaF = ta.ema(close, 9)
+emaS = ta.ema(close, 21)
+biasUp = close > vwap and emaF > emaS and close > emaF
+biasDn = close < vwap and emaF < emaS and close < emaF
 
-biasUp = close > ef and ef > es and close >= vw
-biasDn = close < ef and ef < es and close <= vw
+// ORB break
+orbBuy  = not na(orH) and close > orH and close[1] <= orH
+orbSell = not na(orL) and close < orL and close[1] >= orL
 
-// -----------------------------------------------------------------------------
-//  PROBABILITY SCORE  (0..100)
-//  Each gate contributes; >= 80 fires the "Ready to Fly" signal.
-// -----------------------------------------------------------------------------
-score = 0
-score += squeeze  ? 25 : 0
-score += compr    ? 20 : 0
-score += volReady ? 25 : 0
-score += momReady ? 15 : 0
-score += pinned   ? 15 : 0
+// ─── PROBABILITY SCORE ─────────────────────────────────────────────────────
+upScore = 0
+upScore += biasUp                                   ? 15 : 0
+upScore += (htfUp or not useHTF)                    ? 15 : 0
+upScore += idxUp                                    ? 10 : 0
+upScore += sqzFire                                  ? 15 : 0
+upScore += compr                                    ? 10 : 0
+upScore += volReady                                 ? 15 : 0
+upScore += (bosUp or orbBuy)                        ? 15 : 0
+upScore += (rsi > 50 and rsi < 70 and macdHist > 0) ? 5  : 0
 
-ready = score >= 80
+dnScore = 0
+dnScore += biasDn                                   ? 15 : 0
+dnScore += (htfDn or not useHTF)                    ? 15 : 0
+dnScore += idxDn                                    ? 10 : 0
+dnScore += sqzFire                                  ? 15 : 0
+dnScore += compr                                    ? 10 : 0
+dnScore += volReady                                 ? 15 : 0
+dnScore += (bosDn or orbSell)                       ? 15 : 0
+dnScore += (rsi < 50 and rsi > 30 and macdHist < 0) ? 5  : 0
 
-buyReady  = ready and (biasUp or pinUp)
-sellReady = ready and (biasDn or pinDn) and not buyReady
-flyReady  = ready and not buyReady and not sellReady
+buySig  = inTrade and upScore >= minScore and upScore > dnScore
+sellSig = inTrade and dnScore >= minScore and dnScore > upScore
 
-// -----------------------------------------------------------------------------
-//  PLOTS
-// -----------------------------------------------------------------------------
-plot(ef, "EMA Fast", color=color.new(color.aqua, 0))
-plot(es, "EMA Slow", color=color.new(color.orange, 0))
-p1 = plot(bbU, "BB Upper", color=color.new(color.gray, 70))
-p2 = plot(bbL, "BB Lower", color=color.new(color.gray, 70))
-fill(p1, p2, color=showSqz and squeeze ? color.new(color.yellow, 80) : na)
+var int lastBuyBar  = na
+var int lastSellBar = na
+buyTrigger  = buySig  and (na(lastBuyBar)  or bar_index - lastBuyBar  > cooldown)
+sellTrigger = sellSig and (na(lastSellBar) or bar_index - lastSellBar > cooldown)
+if buyTrigger
+    lastBuyBar  := bar_index
+if sellTrigger
+    lastSellBar := bar_index
 
-plotshape(showLbl and buyReady,  title="BUY READY",
-     style=shape.labelup,   location=location.belowbar,
-     color=color.new(color.lime, 0), textcolor=color.black,
-     text="BUY READY", size=size.small)
+// ─── TRADE PLAN ────────────────────────────────────────────────────────────
+var float entryPx = na
+var float slPx    = na
+var float t1Px    = na
+var float t2Px    = na
+var float t3Px    = na
+var int   side    = 0
 
-plotshape(showLbl and sellReady, title="SELL READY",
-     style=shape.labeldown, location=location.abovebar,
-     color=color.new(color.red, 0),  textcolor=color.white,
-     text="SELL READY", size=size.small)
+if buyTrigger
+    entryPx := close
+    slPx    := close - atr * riskAtr
+    rUnit   = entryPx - slPx
+    t1Px    := entryPx + rUnit * rr1
+    t2Px    := entryPx + rUnit * rr2
+    t3Px    := entryPx + rUnit * rr3
+    side    := 1
+if sellTrigger
+    entryPx := close
+    slPx    := close + atr * riskAtr
+    rUnit   = slPx - entryPx
+    t1Px    := entryPx - rUnit * rr1
+    t2Px    := entryPx - rUnit * rr2
+    t3Px    := entryPx - rUnit * rr3
+    side    := -1
 
-plotshape(showLbl and flyReady,  title="FLY READY",
-     style=shape.diamond,   location=location.absolute,
-     color=color.new(color.fuchsia, 0),
-     size=size.tiny)
+if showPlan and (buyTrigger or sellTrigger)
+    cBuy = color.new(color.lime, 0)
+    cSell= color.new(color.red,  0)
+    col  = side == 1 ? cBuy : cSell
+    line.new(bar_index, entryPx, bar_index + planLen, entryPx, color=color.new(color.blue, 0),  width=2)
+    line.new(bar_index, slPx,    bar_index + planLen, slPx,    color=color.new(color.red,  0),  width=2, style=line.style_dashed)
+    line.new(bar_index, t1Px,    bar_index + planLen, t1Px,    color=color.new(color.green,40), width=1)
+    line.new(bar_index, t2Px,    bar_index + planLen, t2Px,    color=color.new(color.green,20), width=2)
+    line.new(bar_index, t3Px,    bar_index + planLen, t3Px,    color=color.new(color.green, 0), width=3)
+    label.new(bar_index + planLen, entryPx, "ENTRY " + str.tostring(entryPx, "#.##"), style=label.style_label_left, color=color.new(color.blue, 70),  textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, slPx,    "SL "    + str.tostring(slPx,    "#.##"), style=label.style_label_left, color=color.new(color.red,  70),  textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, t1Px,    "T1 "    + str.tostring(t1Px,    "#.##"), style=label.style_label_left, color=color.new(color.green,70),  textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, t2Px,    "T2 "    + str.tostring(t2Px,    "#.##"), style=label.style_label_left, color=color.new(color.green,55),  textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, t3Px,    "T3 "    + str.tostring(t3Px,    "#.##"), style=label.style_label_left, color=color.new(color.green,40),  textcolor=color.white, size=size.small)
 
-if showProb and ready
-    label.new(bar_index, high + atr * 0.5,
-         text="P=" + str.tostring(score) + "%",
-         style=label.style_label_down,
-         color=color.new(color.black, 20),
-         textcolor=color.yellow,
-         size=size.tiny)
+// ─── PLOTS ─────────────────────────────────────────────────────────────────
+plot(showBias ? emaF : na, "EMA9",  color=color.new(color.aqua,   0))
+plot(showBias ? emaS : na, "EMA21", color=color.new(color.orange, 0))
+
+plot(showVWAP ? vwap : na, "VWAP",     color=color.new(color.yellow, 0), linewidth=2)
+plot(showVWAP ? vwU1 : na, "VWAP +1σ", color=color.new(color.yellow,70))
+plot(showVWAP ? vwL1 : na, "VWAP -1σ", color=color.new(color.yellow,70))
+plot(showVWAP ? vwU2 : na, "VWAP +2σ", color=color.new(color.yellow,50))
+plot(showVWAP ? vwL2 : na, "VWAP -2σ", color=color.new(color.yellow,50))
+
+plot(showOR ? orH : na, "OR High", color=color.new(color.aqua,    0), style=plot.style_linebr, linewidth=2)
+plot(showOR ? orL : na, "OR Low",  color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=2)
+
+p1 = plot(bbU, "BB Upper", color=color.new(color.gray, 75))
+p2 = plot(bbL, "BB Lower", color=color.new(color.gray, 75))
+fill(p1, p2, color=showSqz and squeeze ? color.new(color.yellow, 88) : na)
 
 bgcolor(showSqz and squeeze ? color.new(color.yellow, 92) : na, title="Squeeze BG")
+bgcolor(showSqz and sqzFire ? color.new(color.orange, 80) : na, title="Squeeze Fire")
+bgcolor(not inTrade and inFull ? color.new(color.gray, 92) : na, title="No-Trade Window")
 
-// -----------------------------------------------------------------------------
-//  ALERTS
-// -----------------------------------------------------------------------------
-alertcondition(buyReady,  title="Early Move - BUY READY",
-     message="EarlyMove: BUY READY on {{ticker}} @ {{close}} (P>=80%)")
-alertcondition(sellReady, title="Early Move - SELL READY",
-     message="EarlyMove: SELL READY on {{ticker}} @ {{close}} (P>=80%)")
-alertcondition(flyReady,  title="Early Move - FLY READY (any side)",
-     message="EarlyMove: FLY READY on {{ticker}} @ {{close}} (P>=80%)")
+plotshape(buyTrigger,  "BUY GEM",  shape.labelup,   location.belowbar,
+     color=color.new(color.lime, 0), text="BUY GEM",  textcolor=color.black, size=size.normal)
+plotshape(sellTrigger, "SELL GEM", shape.labeldown, location.abovebar,
+     color=color.new(color.red,  0), text="SELL GEM", textcolor=color.white, size=size.normal)
 
-if alertOn and buyReady
-    alert("EarlyMove BUY READY " + syminfo.ticker, alert.freq_once_per_bar_close)
-if alertOn and sellReady
-    alert("EarlyMove SELL READY " + syminfo.ticker, alert.freq_once_per_bar_close)
-if alertOn and flyReady
-    alert("EarlyMove FLY READY " + syminfo.ticker, alert.freq_once_per_bar_close)
+if buyTrigger
+    label.new(bar_index, low  - atr * 0.6,
+         text="P=" + str.tostring(upScore) + "%  RVOL " + str.tostring(rvol, "#.#") + "x",
+         style=label.style_label_up, color=color.new(color.black, 30),
+         textcolor=color.lime, size=size.small)
+if sellTrigger
+    label.new(bar_index, high + atr * 0.6,
+         text="P=" + str.tostring(dnScore) + "%  RVOL " + str.tostring(rvol, "#.#") + "x",
+         style=label.style_label_down, color=color.new(color.black, 30),
+         textcolor=color.red, size=size.small)
+
+// ─── DASHBOARD ─────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 10, border_width=1)
+if showDash and barstate.islast
+    bUp = upScore  >= minScore
+    bDn = dnScore  >= minScore
+    table.cell(dash, 0, 0, "GEM Catcher Pro",     bgcolor=color.new(color.navy, 0), text_color=color.white,  text_size=size.normal)
+    table.cell(dash, 1, 0, syminfo.ticker,        bgcolor=color.new(color.navy, 0), text_color=color.yellow, text_size=size.normal)
+    table.cell(dash, 0, 1, "Bias",                bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 1, biasUp ? "LONG" : biasDn ? "SHORT" : "FLAT",
+         bgcolor=biasUp ? color.green : biasDn ? color.red : color.gray, text_color=color.white)
+    table.cell(dash, 0, 2, "HTF " + htfTF,        bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 2, htfUp ? "UP" : htfDn ? "DOWN" : "FLAT",
+         bgcolor=htfUp ? color.green : htfDn ? color.red : color.gray, text_color=color.white)
+    table.cell(dash, 0, 3, "Up Score",            bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(upScore), bgcolor=bUp ? color.green : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 4, "Dn Score",            bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 4, str.tostring(dnScore), bgcolor=bDn ? color.red : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 5, "RVOL",                bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(rvol, "#.##") + "x",
+         bgcolor=volReady ? color.green : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 6, "ATR",                 bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(atr, "#.##"), bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 0, 7, "Squeeze",             bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 7, squeeze ? "ON" : sqzFire ? "FIRED" : "OFF",
+         bgcolor=squeeze ? color.yellow : sqzFire ? color.orange : color.new(color.gray, 30), text_color=color.black)
+    table.cell(dash, 0, 8, "Window",              bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 8, inTrade ? "TRADE OK" : "NO-TRADE",
+         bgcolor=inTrade ? color.green : color.red, text_color=color.white)
+    table.cell(dash, 0, 9, "Last Side",           bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 9, side == 1 ? "LONG @ " + str.tostring(entryPx, "#.##") : side == -1 ? "SHORT @ " + str.tostring(entryPx, "#.##") : "—",
+         bgcolor=side == 1 ? color.new(color.green, 40) : side == -1 ? color.new(color.red, 40) : color.new(color.gray, 30), text_color=color.white)
+
+// ─── ALERTS ────────────────────────────────────────────────────────────────
+alertcondition(buyTrigger,  title="GEM BUY",
+     message='{"sym":"{{ticker}}","side":"BUY","px":{{close}},"score":"see chart","plan":"SL/T1/T2/T3 on chart"}')
+alertcondition(sellTrigger, title="GEM SELL",
+     message='{"sym":"{{ticker}}","side":"SELL","px":{{close}},"score":"see chart","plan":"SL/T1/T2/T3 on chart"}')
+
+if buyTrigger
+    alert("GEM BUY " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
+         " | SL " + str.tostring(slPx, "#.##") +
+         " | T1 " + str.tostring(t1Px, "#.##") +
+         " | T2 " + str.tostring(t2Px, "#.##") +
+         " | T3 " + str.tostring(t3Px, "#.##") +
+         " | P=" + str.tostring(upScore) + "%",
+         alert.freq_once_per_bar_close)
+if sellTrigger
+    alert("GEM SELL " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
+         " | SL " + str.tostring(slPx, "#.##") +
+         " | T1 " + str.tostring(t1Px, "#.##") +
+         " | T2 " + str.tostring(t2Px, "#.##") +
+         " | T3 " + str.tostring(t3Px, "#.##") +
+         " | P=" + str.tostring(dnScore) + "%",
+         alert.freq_once_per_bar_close)
