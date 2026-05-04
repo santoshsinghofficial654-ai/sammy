@@ -1,0 +1,311 @@
+//@version=5
+// =============================================================================
+//  AI Pre-Breakout Pressure  [NSE Intraday]
+//  Pine Script v5, non-repainting (signal only on barstate.isconfirmed)
+//
+//  Goal: enter BEFORE the breakout candle prints, while price is being
+//  compressed at an institutional level under one-sided pressure.
+//
+//  All 10 conditions from spec are enforced:
+//   1  Near institutional level (PDH/PDL/Pivot/S1/R1/swing demand/supply)
+//      with distance 0.3% - 0.8%
+//   2  Compression phase: 3-6 of last bars have range < 0.7 * ATR
+//   3  Volume > SMA(vol, 5) and rising into compression
+//   4  Directional bias: more bull/bear closes + closes near candle extremes
+//   5  Wick behaviour: lower-wick stack (accum) vs upper-wick stack (distrib)
+//   6  Entry BEFORE breakout — no breakout-confirmation required
+//   7  Candle size filter: every compression bar <= 1.2 * ATR
+//   8  Auto SL = compression low/high; TP at minimum 1:2 R
+//   9  Anti-fake: rejects no-volume / mixed-direction / oversized bars
+//  10  Highlights compression box, levels, early-entry labels, alerts
+// =============================================================================
+indicator("AI Pre-Breakout Pressure [NSE Intraday]",
+     shorttitle="AI PreBreak",
+     overlay=true,
+     max_boxes_count=200,
+     max_lines_count=500,
+     max_labels_count=500)
+
+// ─── INPUTS ────────────────────────────────────────────────────────────────
+gComp = "Compression"
+compMax     = input.int(6,   "Compression Lookback (bars)", minval=3, maxval=12, group=gComp)
+compMin     = input.int(3,   "Min Small Bars in Window",    minval=2,  group=gComp)
+compRngATR  = input.float(0.7,"Small Bar = Range < ATR x", minval=0.3, step=0.05, group=gComp)
+maxBarATR   = input.float(1.2,"Reject if any bar > ATR x", minval=0.8, step=0.1,  group=gComp)
+atrLen      = input.int(14,  "ATR Length",                  minval=5, group=gComp)
+
+gLvl = "Institutional Levels"
+distMinPct  = input.float(0.3,"Min distance from level (%)", minval=0.0, step=0.05, group=gLvl)
+distMaxPct  = input.float(0.8,"Max distance from level (%)", minval=0.1, step=0.05, group=gLvl)
+pivLen      = input.int(10,  "Swing Pivot for Demand/Supply", minval=3, group=gLvl)
+showLevels  = input.bool(true,"Plot Levels (PDH/PDL/Pivot/S1/R1)", group=gLvl)
+
+gVol = "Volume"
+volLen      = input.int(5,   "Volume SMA",          minval=2, group=gVol)
+needVolRise = input.bool(true,"Require rising volume into compression", group=gVol)
+
+gBias = "Directional Bias"
+closeNearEdge = input.float(0.65,"Close near edge >= range fraction", minval=0.5, step=0.05, group=gBias)
+wickRatio   = input.float(1.2,"Wick imbalance ratio", minval=1.0, step=0.05, group=gBias)
+
+gRisk = "Risk / Targets"
+rrTarget    = input.float(2.0,"Risk:Reward (T1)", minval=1.0, step=0.1, group=gRisk)
+slBufferTks = input.float(2.0,"SL buffer (ticks)", minval=0, step=0.5, group=gRisk)
+planLen     = input.int(40,  "Plan length (bars)", minval=10, group=gRisk)
+cooldown    = input.int(10,  "Cooldown bars between signals", minval=1, group=gRisk)
+
+gSes = "NSE Session (IST)"
+useSession  = input.bool(true,"Restrict to NSE session", group=gSes)
+sessTrade   = input.session("0930-1500","Tradable Window", group=gSes)
+
+gVis = "Visuals"
+showComp    = input.bool(true,"Highlight Compression Box", group=gVis)
+showPlan    = input.bool(true,"Show Trade Plan",            group=gVis)
+showDash    = input.bool(true,"Show Dashboard",             group=gVis)
+
+tz = "Asia/Kolkata"
+
+// ─── BASIC SERIES ──────────────────────────────────────────────────────────
+atr     = ta.atr(atrLen)
+mintick = syminfo.mintick
+inSess  = not useSession or not na(time(timeframe.period, sessTrade, tz))
+
+// ─── INSTITUTIONAL LEVELS ──────────────────────────────────────────────────
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+pivotPP = (pdh + pdl + pdc) / 3.0
+r1 = 2 * pivotPP - pdl
+s1 = 2 * pivotPP - pdh
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,  pivLen, pivLen)
+var float lastSupply = na
+var float lastDemand = na
+if not na(ph)
+    lastSupply := ph
+if not na(pl)
+    lastDemand := pl
+
+distPct(level) =>
+    na(level) ? na : math.abs(close - level) / close * 100.0
+
+near(level) =>
+    d = distPct(level)
+    not na(d) and d >= distMinPct and d <= distMaxPct
+
+nearBuyLvl  = near(pdl) or near(s1) or near(pivotPP) or near(lastDemand)
+nearSellLvl = near(pdh) or near(r1) or near(pivotPP) or near(lastSupply)
+
+buyLvlName  = near(pdl) ? "PDL" : near(s1) ? "S1" : near(pivotPP) ? "Pivot" : near(lastDemand) ? "Demand" : ""
+sellLvlName = near(pdh) ? "PDH" : near(r1) ? "R1" : near(pivotPP) ? "Pivot" : near(lastSupply) ? "Supply" : ""
+
+// ─── COMPRESSION ANALYSIS ──────────────────────────────────────────────────
+smallCnt = 0
+bigCnt   = 0
+bullCnt  = 0
+bearCnt  = 0
+nearHi   = 0
+nearLo   = 0
+sumLoWick = 0.0
+sumUpWick = 0.0
+sumVolNew = 0.0
+sumVolOld = 0.0
+half = compMax / 2
+
+for i = 0 to compMax - 1
+    rng = high[i] - low[i]
+    if rng <= atr * compRngATR
+        smallCnt += 1
+    if rng > atr * maxBarATR
+        bigCnt += 1
+    if close[i] > open[i]
+        bullCnt += 1
+    if close[i] < open[i]
+        bearCnt += 1
+    if rng > 0
+        pos = (close[i] - low[i]) / rng
+        if pos >= closeNearEdge
+            nearHi += 1
+        if pos <= 1.0 - closeNearEdge
+            nearLo += 1
+    sumLoWick += math.min(open[i], close[i]) - low[i]
+    sumUpWick += high[i] - math.max(open[i], close[i])
+    if i < half
+        sumVolNew += volume[i]
+    else
+        sumVolOld += volume[i]
+
+compHi = ta.highest(high, compMax)
+compLo = ta.lowest(low,  compMax)
+
+compressionOk = smallCnt >= compMin and bigCnt == 0
+
+// ─── VOLUME ───────────────────────────────────────────────────────────────
+volMA   = ta.sma(volume, volLen)
+volHigh = volume > volMA
+volRise = not needVolRise or sumVolNew > sumVolOld
+volOk   = volHigh and volRise
+
+// ─── DIRECTIONAL BIAS ──────────────────────────────────────────────────────
+bullBias = bullCnt > bearCnt and nearHi >= half
+bearBias = bearCnt > bullCnt and nearLo >= half
+
+// ─── WICK BEHAVIOUR ────────────────────────────────────────────────────────
+wickAccum  = sumLoWick > sumUpWick * wickRatio
+wickDistro = sumUpWick > sumLoWick * wickRatio
+
+// ─── ANTI-FAKE GATE ────────────────────────────────────────────────────────
+clearBull = bullBias and wickAccum
+clearBear = bearBias and wickDistro
+
+// ─── FINAL SIGNALS (PRE-BREAKOUT) ──────────────────────────────────────────
+rawBuy  = inSess and compressionOk and volOk and clearBull and nearBuyLvl
+rawSell = inSess and compressionOk and volOk and clearBear and nearSellLvl
+
+var int lastBuyBar  = na
+var int lastSellBar = na
+buySig  = barstate.isconfirmed and rawBuy  and (na(lastBuyBar)  or bar_index - lastBuyBar  > cooldown)
+sellSig = barstate.isconfirmed and rawSell and (na(lastSellBar) or bar_index - lastSellBar > cooldown)
+if buySig
+    lastBuyBar  := bar_index
+if sellSig
+    lastSellBar := bar_index
+
+// ─── TRADE PLAN ────────────────────────────────────────────────────────────
+var float entryPx = na
+var float slPx    = na
+var float tpPx    = na
+var int   side    = 0
+var string lvlTag = ""
+
+if buySig
+    entryPx := close
+    slPx    := compLo - slBufferTks * mintick
+    risk    = entryPx - slPx
+    tpPx    := entryPx + risk * rrTarget
+    side    := 1
+    lvlTag  := buyLvlName
+if sellSig
+    entryPx := close
+    slPx    := compHi + slBufferTks * mintick
+    risk    = slPx - entryPx
+    tpPx    := entryPx - risk * rrTarget
+    side    := -1
+    lvlTag  := sellLvlName
+
+if showPlan and (buySig or sellSig)
+    line.new(bar_index, entryPx, bar_index + planLen, entryPx,
+         color=color.new(color.blue, 0),  width=2)
+    line.new(bar_index, slPx,    bar_index + planLen, slPx,
+         color=color.new(color.red,  0),  width=2, style=line.style_dashed)
+    line.new(bar_index, tpPx,    bar_index + planLen, tpPx,
+         color=color.new(color.green,0),  width=3)
+    label.new(bar_index + planLen, entryPx, "ENTRY " + str.tostring(entryPx, "#.##"),
+         style=label.style_label_left, color=color.new(color.blue, 70),
+         textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, slPx,    "SL " + str.tostring(slPx, "#.##"),
+         style=label.style_label_left, color=color.new(color.red, 70),
+         textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, tpPx,    "T " + str.tostring(tpPx, "#.##") +
+         " (1:" + str.tostring(rrTarget, "#.#") + ")",
+         style=label.style_label_left, color=color.new(color.green, 60),
+         textcolor=color.white, size=size.small)
+
+// ─── COMPRESSION BOX ───────────────────────────────────────────────────────
+if showComp and (buySig or sellSig)
+    box.new(bar_index - compMax + 1, compHi, bar_index, compLo,
+         border_color=color.new(color.aqua, 30),
+         bgcolor=color.new(color.aqua, 88),
+         border_width=2)
+
+// ─── PLOTS ─────────────────────────────────────────────────────────────────
+plot(showLevels ? pdh : na,    "PDH",   color=color.new(color.red,    20), linewidth=1, style=plot.style_circles)
+plot(showLevels ? pdl : na,    "PDL",   color=color.new(color.green,  20), linewidth=1, style=plot.style_circles)
+plot(showLevels ? pivotPP : na,"Pivot", color=color.new(color.yellow, 20), linewidth=1, style=plot.style_circles)
+plot(showLevels ? r1 : na,     "R1",    color=color.new(color.red,    60), linewidth=1)
+plot(showLevels ? s1 : na,     "S1",    color=color.new(color.green,  60), linewidth=1)
+plot(showLevels and not na(lastSupply) ? lastSupply : na, "Swing Supply",
+     color=color.new(color.maroon, 40), style=plot.style_linebr, linewidth=1)
+plot(showLevels and not na(lastDemand) ? lastDemand : na, "Swing Demand",
+     color=color.new(color.teal, 40),   style=plot.style_linebr, linewidth=1)
+
+plotshape(buySig,  "BUY EARLY",  shape.labelup,   location.belowbar,
+     color=color.new(color.lime, 0), text="EARLY BUY",  textcolor=color.black, size=size.normal)
+plotshape(sellSig, "SELL EARLY", shape.labeldown, location.abovebar,
+     color=color.new(color.red, 0),  text="EARLY SELL", textcolor=color.white, size=size.normal)
+
+if buySig
+    label.new(bar_index, low - atr * 0.6,
+         text="@ " + lvlTag + "  vol " + str.tostring(volume / volMA, "#.#") + "x",
+         style=label.style_label_up, color=color.new(color.black, 30),
+         textcolor=color.lime, size=size.small)
+if sellSig
+    label.new(bar_index, high + atr * 0.6,
+         text="@ " + lvlTag + "  vol " + str.tostring(volume / volMA, "#.#") + "x",
+         style=label.style_label_down, color=color.new(color.black, 30),
+         textcolor=color.red, size=size.small)
+
+bgcolor(compressionOk and (nearBuyLvl or nearSellLvl) ? color.new(color.aqua, 92) : na,
+     title="Coiling at Level")
+
+// ─── DASHBOARD ─────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 9, border_width=1)
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "AI Pre-Breakout", bgcolor=color.new(color.navy, 0),
+         text_color=color.white,  text_size=size.normal)
+    table.cell(dash, 1, 0, syminfo.ticker,    bgcolor=color.new(color.navy, 0),
+         text_color=color.yellow, text_size=size.normal)
+    table.cell(dash, 0, 1, "Compression", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 1, str.tostring(smallCnt) + "/" + str.tostring(compMax) +
+         (bigCnt > 0 ? " ✗big" : ""),
+         bgcolor=compressionOk ? color.green : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 2, "Vol vs MA", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(volume / volMA, "#.##") + "x" + (volRise ? " ↑" : " ↓"),
+         bgcolor=volOk ? color.green : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 3, "Bull / Bear", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(bullCnt) + " / " + str.tostring(bearCnt),
+         bgcolor=clearBull ? color.green : clearBear ? color.red : color.new(color.gray, 30),
+         text_color=color.white)
+    table.cell(dash, 0, 4, "Wick LO/UP", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 4, str.tostring(sumLoWick, "#.##") + " / " + str.tostring(sumUpWick, "#.##"),
+         bgcolor=wickAccum ? color.green : wickDistro ? color.red : color.new(color.gray, 30),
+         text_color=color.white)
+    table.cell(dash, 0, 5, "Near Lvl", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 5, nearBuyLvl ? buyLvlName : nearSellLvl ? sellLvlName : "—",
+         bgcolor=nearBuyLvl ? color.green : nearSellLvl ? color.red : color.new(color.gray, 30),
+         text_color=color.white)
+    table.cell(dash, 0, 6, "Setup", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    setupTxt = rawBuy ? "BUY READY" : rawSell ? "SELL READY" : "—"
+    table.cell(dash, 1, 6, setupTxt,
+         bgcolor=rawBuy ? color.green : rawSell ? color.red : color.new(color.gray, 30),
+         text_color=color.white)
+    table.cell(dash, 0, 7, "Active", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 7, side == 1 ? "LONG" : side == -1 ? "SHORT" : "FLAT",
+         bgcolor=side == 1 ? color.green : side == -1 ? color.red : color.new(color.gray, 30),
+         text_color=color.white)
+    table.cell(dash, 0, 8, "Entry", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 8, na(entryPx) ? "—" :
+         str.tostring(entryPx, "#.##") + "  SL " + str.tostring(slPx, "#.##") +
+         "  T " + str.tostring(tpPx, "#.##"),
+         bgcolor=color.black, text_color=color.white)
+
+// ─── ALERTS ────────────────────────────────────────────────────────────────
+alertcondition(buySig,  title="EARLY BUY",
+     message='EARLY BUY {{ticker}} @ {{close}} — pre-breakout pressure at level, see chart for SL / T')
+alertcondition(sellSig, title="EARLY SELL",
+     message='EARLY SELL {{ticker}} @ {{close}} — pre-breakout pressure at level, see chart for SL / T')
+
+if buySig
+    alert("EARLY BUY " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
+         " | LVL " + lvlTag +
+         " | SL " + str.tostring(slPx, "#.##") +
+         " | T  " + str.tostring(tpPx, "#.##") +
+         " (1:" + str.tostring(rrTarget, "#.#") + ")",
+         alert.freq_once_per_bar_close)
+if sellSig
+    alert("EARLY SELL " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
+         " | LVL " + lvlTag +
+         " | SL " + str.tostring(slPx, "#.##") +
+         " | T  " + str.tostring(tpPx, "#.##") +
+         " (1:" + str.tostring(rrTarget, "#.#") + ")",
+         alert.freq_once_per_bar_close)
