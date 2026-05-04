@@ -1,0 +1,212 @@
+//@version=5
+// =============================================================================
+//  FIRE ZONES - Strongest Intraday Supply & Demand
+//  Detects HEAVY institutional accumulation / distribution candles.
+//  Non-repainting (delayed confirmation via history).
+//  Designed to be visible and reliable on 5m / 15m NSE charts.
+// =============================================================================
+indicator("FIRE ZONES - Strongest Intraday S/D", shorttitle="FIRE ZONES", overlay=true, max_boxes_count=200, max_lines_count=200, max_labels_count=200)
+
+// -----------------------------------------------------------------------------
+//  INPUTS
+// -----------------------------------------------------------------------------
+gC = "Detection (Heavy Institutional Footprint)"
+atrLen        = input.int(14,   "ATR Length",                    minval=2,  group=gC)
+rangeMult     = input.float(1.5,"Min Range x ATR",              minval=0.5, step=0.1, group=gC)
+volMult       = input.float(2.0,"Min Volume x SMA (Heavy)",     minval=1.0, step=0.1, group=gC)
+volLen        = input.int(20,   "Volume SMA Length",             minval=2,  group=gC)
+bodyMin       = input.float(0.6,"Min Body / Range",              minval=0.3, maxval=1.0, step=0.05, group=gC)
+confirmBars   = input.int(3,    "Confirmation Bars (after candle)", minval=1, maxval=10, group=gC)
+followThru    = input.float(1.0,"Follow-Through x ATR",          minval=0.1, step=0.1, group=gC)
+sweepLookback = input.int(10,   "Liquidity Sweep Lookback",      minval=2,  group=gC)
+requireSweep  = input.bool(true,"Require Liquidity Sweep",      group=gC)
+
+gZ = "Zone Behaviour"
+intradayOnly       = input.bool(true, "Intraday Only (auto-expire next day)", group=gZ)
+removeOnInvalidate = input.bool(true, "Remove on Invalidation",  group=gZ)
+extendRight        = input.bool(true, "Extend Zones Right",      group=gZ)
+maxFire            = input.int(6,    "Max Active Fire Zones / Side", minval=1, maxval=15, group=gZ)
+showMid            = input.bool(true, "Show Mid-Zone Equilibrium",  group=gZ)
+
+gA = "Alerts"
+alertNew   = input.bool(true, "Alert when New Fire Zone Forms",  group=gA)
+alertTouch = input.bool(true, "Alert when Price Touches Fire Zone", group=gA)
+
+gS = "Style"
+demFill = input.color(color.new(#00ff88, 70), "Demand Fill",   group=gS)
+supFill = input.color(color.new(#ff1744, 70), "Supply Fill",   group=gS)
+demEdge = input.color(#00ff88, "Demand Border", group=gS)
+supEdge = input.color(#ff1744, "Supply Border", group=gS)
+demTxt  = input.string("HEAVY BUYING",  "Demand Label", group=gS)
+supTxt  = input.string("HEAVY SELLING", "Supply Label", group=gS)
+showLbl = input.bool(true, "Show Labels", group=gS)
+
+// -----------------------------------------------------------------------------
+//  CORE CALCS
+// -----------------------------------------------------------------------------
+atrV = ta.atr(atrLen)
+volA = ta.sma(volume, volLen)
+rng  = high - low
+body = math.abs(close - open)
+
+n = confirmBars
+
+// Originating candle criteria — referenced n bars back (already historical / confirmed)
+isBullCand = (rng[n] > 0) and rng[n] >= atrV[n] * rangeMult and volume[n] >= volA[n] * volMult and body[n] >= rng[n] * bodyMin and close[n] > open[n]
+isBearCand = (rng[n] > 0) and rng[n] >= atrV[n] * rangeMult and volume[n] >= volA[n] * volMult and body[n] >= rng[n] * bodyMin and close[n] < open[n]
+
+// Liquidity sweep: candidate broke prior swing low / high (bars BEFORE candidate)
+priorLow  = ta.lowest(low,  sweepLookback)[n + 1]
+priorHigh = ta.highest(high, sweepLookback)[n + 1]
+sweepDem = (not requireSweep) or ((not na(priorLow))  and low[n]  < priorLow)
+sweepSup = (not requireSweep) or ((not na(priorHigh)) and high[n] > priorHigh)
+
+// Follow-through: price moved AWAY in the trade direction during the n bars after candidate
+postHigh = ta.highest(high, n)
+postLow  = ta.lowest(low,  n)
+ftDem = postHigh > high[n] + atrV[n] * followThru
+ftSup = postLow  < low[n]  - atrV[n] * followThru
+
+newFireDem = barstate.isconfirmed and isBullCand and sweepDem and ftDem
+newFireSup = barstate.isconfirmed and isBearCand and sweepSup and ftSup
+
+// -----------------------------------------------------------------------------
+//  ZONE STORAGE
+// -----------------------------------------------------------------------------
+type FZ
+    box   bx
+    line  midL
+    label lbl
+    float top
+    float bot
+    int   created
+    bool  isDem
+    bool  touched
+    bool  alive
+
+var array<FZ> fires = array.new<FZ>()
+
+f_kill(FZ z) =>
+    box.delete(z.bx)
+    if not na(z.midL)
+        line.delete(z.midL)
+    if not na(z.lbl)
+        label.delete(z.lbl)
+    z.alive := false
+    z
+
+f_draw(bool _dem, float _top, float _bot, int _leftBar) =>
+    color fc = _dem ? demFill : supFill
+    color bc = _dem ? demEdge : supEdge
+    int   rightX = extendRight ? bar_index + 500 : bar_index + 30
+    box   bx = box.new(left=_leftBar, top=_top, right=rightX, bottom=_bot, border_color=bc, border_width=2, bgcolor=fc, extend=extendRight ? extend.right : extend.none)
+    float mid = (_top + _bot) / 2.0
+    line  ml = na
+    if showMid
+        ml := line.new(_leftBar, mid, rightX, mid, color=color.new(bc, 30), style=line.style_dotted, extend=extendRight ? extend.right : extend.none)
+    label lb = na
+    if showLbl
+        string txt = "FIRE " + (_dem ? demTxt : supTxt)
+        lb := label.new(bar_index, _dem ? _bot : _top, txt, style=_dem ? label.style_label_up : label.style_label_down, color=color.new(bc, 0), textcolor=color.white, size=size.small)
+    FZ.new(bx, ml, lb, _top, _bot, bar_index, _dem, false, true)
+
+f_add(bool _dem, float _top, float _bot, int _leftBar) =>
+    FZ z = f_draw(_dem, _top, _bot, _leftBar)
+    array.push(fires, z)
+    int sc = 0
+    if array.size(fires) > 0
+        for i = 0 to array.size(fires) - 1
+            FZ zi = array.get(fires, i)
+            if zi.isDem == _dem and zi.alive
+                sc += 1
+    if sc > maxFire
+        bool removed = false
+        if array.size(fires) > 0
+            for i = 0 to array.size(fires) - 1
+                if not removed
+                    FZ zj = array.get(fires, i)
+                    if zj.isDem == _dem and zj.alive
+                        FZ killed = f_kill(zj)
+                        array.set(fires, i, killed)
+                        removed := true
+
+// -----------------------------------------------------------------------------
+//  CREATE NEW FIRE ZONES (originating candle = n bars ago)
+// -----------------------------------------------------------------------------
+if newFireDem
+    float topZ = math.max(open[n], close[n])
+    float botZ = math.min(open[n], low[n])
+    f_add(true, topZ, botZ, bar_index - n)
+
+if newFireSup
+    float topZ = math.max(open[n], high[n])
+    float botZ = math.min(open[n], close[n])
+    f_add(false, topZ, botZ, bar_index - n)
+
+// -----------------------------------------------------------------------------
+//  ZONE MANAGEMENT
+// -----------------------------------------------------------------------------
+isNewDay = ta.change(time("D")) != 0
+bool fdTouchAlert = false
+bool fsTouchAlert = false
+
+if array.size(fires) > 0
+    for i = 0 to array.size(fires) - 1
+        FZ z = array.get(fires, i)
+        if z.alive
+            bool expired = intradayOnly and isNewDay and bar_index > z.created
+            if expired
+                FZ killed = f_kill(z)
+                array.set(fires, i, killed)
+            else
+                bool inv = false
+                if z.isDem and close < z.bot
+                    inv := true
+                if (not z.isDem) and close > z.top
+                    inv := true
+                if inv
+                    if removeOnInvalidate
+                        FZ killed = f_kill(z)
+                        array.set(fires, i, killed)
+                    else
+                        box.set_bgcolor(z.bx, color.new(color.gray, 90))
+                        box.set_border_color(z.bx, color.new(color.gray, 60))
+                        if not na(z.midL)
+                            line.delete(z.midL)
+                            z.midL := na
+                        z.alive := false
+                        array.set(fires, i, z)
+                else
+                    bool touchNow = false
+                    if z.isDem and low <= z.top and high >= z.bot
+                        touchNow := true
+                    if (not z.isDem) and high >= z.bot and low <= z.top
+                        touchNow := true
+                    if touchNow and (not z.touched)
+                        z.touched := true
+                        if z.isDem
+                            fdTouchAlert := true
+                        else
+                            fsTouchAlert := true
+                        array.set(fires, i, z)
+
+// -----------------------------------------------------------------------------
+//  ALERTS
+// -----------------------------------------------------------------------------
+if alertNew and newFireDem
+    alert("FIRE Demand Zone Formed - Heavy Buying Detected", alert.freq_once_per_bar)
+if alertNew and newFireSup
+    alert("FIRE Supply Zone Formed - Heavy Selling Detected", alert.freq_once_per_bar)
+if alertTouch and fdTouchAlert
+    alert("FIRE BUY ZONE TOUCHED - Expect Strong Move UP", alert.freq_once_per_bar)
+if alertTouch and fsTouchAlert
+    alert("FIRE SELL ZONE TOUCHED - Expect Strong Move DOWN", alert.freq_once_per_bar)
+
+alertcondition(newFireDem,    title="New Fire Demand",     message="FIRE Demand Zone Formed - Heavy Buying Detected")
+alertcondition(newFireSup,    title="New Fire Supply",     message="FIRE Supply Zone Formed - Heavy Selling Detected")
+alertcondition(fdTouchAlert,  title="Fire Demand Touched", message="FIRE BUY ZONE TOUCHED - Expect Strong Move UP")
+alertcondition(fsTouchAlert,  title="Fire Supply Touched", message="FIRE SELL ZONE TOUCHED - Expect Strong Move DOWN")
+
+// =============================================================================
+//  END
+// =============================================================================
