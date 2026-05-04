@@ -1,325 +1,343 @@
 //@version=5
 // =============================================================================
-//  GEM Catcher Pro  -  NSE Intraday Early-Move Indicator
-//  Standalone, non-repainting, Pine Script v5
-//  Tuned for NSE cash & F&O stocks, NIFTY, BANKNIFTY on 3m / 5m / 15m
+//  AI Precision Reversal Catcher  [NSE Intraday]
+//  Standalone, non-repainting (signals confirm only on bar close), Pine v5
 //
-//  Edge stack (signal fires only when a weighted majority aligns):
-//    1. NSE session window filter (skip 09:15-09:30 noise & last 30 min)
-//    2. Anchored VWAP from session open + 1σ / 2σ bands
-//    3. 15-min Opening Range high/low + breakout confirmation
-//    4. Higher-Timeframe (15m default) EMA20 / EMA50 trend alignment
-//    5. Optional NIFTY index bias confirmation
-//    6. TTM-style volatility squeeze (BB inside Keltner) + release trigger
-//    7. NR-N / inside-bar range compression
-//    8. Relative Volume (RVOL >= 1.5x by default)
-//    9. Pivot Break-of-Structure (BOS) on swing high / low
-//   10. Trend-aligned EMA9 / EMA21 + RSI / MACD-hist filter
+//  Why this avoids the "SL hit" problem the breakout version had:
+//  ─────────────────────────────────────────────────────────────────
+//  • It does NOT chase breakouts. Breakouts retest → tight SL gets hit.
+//  • It waits for price to push INTO a real demand / supply zone, then
+//    prints a BUY / SELL only when the bar CLOSES back out of the zone
+//    (engulfing, hammer, pin-bar with strong rejection wick + volume).
+//  • Stop-loss is anchored to the signal candle's own wick + tick buffer,
+//    not a generic ATR multiple — the SL only hits if the rejection
+//    physically fails on price.
+//  • Targets are real chart structure (opposite zone / prior swing /
+//    VWAP), not made-up R-multiples.
+//  • Chop filter (ADX) blocks signals in sideways tape where wicks fail.
+//  • HTF (15m) EMA20/50 trend filter — counter-trend trades only allowed
+//    at deep zones, with-trend trades preferred.
 //
-//  Outputs:
-//    • BUY GEM / SELL GEM labels with probability score
-//    • Auto trade plan: Entry, SL (ATR-based), T1 / T2 / T3 (R-multiples)
-//    • Dashboard table: bias, HTF, RVOL, ATR, scores, squeeze, window
-//    • Alerts (alertcondition + runtime alert)
+//  What you get on chart:
+//    • Demand (green) and Supply (red) zone boxes from real swings
+//    • BUY / SELL labels printed on the exact rejection candle
+//    • Auto Entry / SL / Target lines drawn from that candle
+//    • Win-stat / live state dashboard
 // =============================================================================
-indicator("GEM Catcher Pro [NSE Intraday]",
-     shorttitle="GEM Pro",
+indicator("AI Precision Reversal Catcher [NSE Intraday]",
+     shorttitle="AI Reversal",
      overlay=true,
-     max_labels_count=500,
+     max_boxes_count=500,
      max_lines_count=500,
-     max_boxes_count=500)
+     max_labels_count=500)
 
 // ─── INPUTS ────────────────────────────────────────────────────────────────
-gSes  = "Session (NSE / IST)"
-sessTrade = input.session("0930-1500", "Tradable Window",  group=gSes,
-     tooltip="Skips 09:15-09:30 opening volatility & last 30 min auction drift")
-sessOR    = input.session("0915-0930", "Opening Range",    group=gSes)
-sessFull  = input.session("0915-1525", "Full Session",     group=gSes)
-skipLunch = input.bool(false, "Skip Lunch (11:30-13:00)",  group=gSes)
-sessLunch = input.session("1130-1300","Lunch Window",      group=gSes)
+gZone = "Zone Detection"
+pivLen   = input.int(8,  "Swing Pivot Length", minval=3, group=gZone,
+     tooltip="Higher = stronger zones, fewer signals")
+zoneATR  = input.float(0.6,"Zone Width (ATR x)", minval=0.1, step=0.1, group=gZone)
+zoneKeep = input.int(6,  "Max Active Zones (per side)", minval=2, group=gZone)
+zoneTouchMax = input.int(2, "Invalidate after N touches", minval=1, group=gZone)
 
-gCore = "Detection Engine"
-bbLen   = input.int(20,   "BB / KC Length",      minval=5,  group=gCore)
-bbMult  = input.float(2.0,"BB Std-Dev",          minval=0.5,step=0.1, group=gCore)
-kcMult  = input.float(1.5,"KC ATR Mult",         minval=0.5,step=0.1, group=gCore)
-nrLook  = input.int(7,    "NR-N Lookback",       minval=3,  group=gCore)
-volLen  = input.int(20,   "Volume MA Length",    minval=5,  group=gCore)
-rvolMin = input.float(1.5,"Min Relative Volume", minval=0.5,step=0.1, group=gCore)
-atrLen  = input.int(14,   "ATR Length",          minval=5,  group=gCore)
-pivLen  = input.int(10,   "Swing Pivot",         minval=3,  group=gCore)
+gCandle = "Rejection Candle Filter"
+minWickRatio = input.float(0.55,"Min Rejection-Wick / Range", minval=0.3, step=0.05, group=gCandle,
+     tooltip="0.55 = wick must be >= 55% of the bar's range")
+maxBodyRatio = input.float(0.40,"Max Body / Range",          minval=0.1, step=0.05, group=gCandle)
+needEngulf   = input.bool(false,"Require Engulfing OR Pin",  group=gCandle,
+     tooltip="If on, only engulfing or pin-bar pass; if off, hammer/shooting-star also pass")
+volLen   = input.int(20, "Volume MA Length",  minval=5, group=gCandle)
+volMult  = input.float(1.3,"Volume Spike x MA", minval=1.0, step=0.1, group=gCandle)
 
-gHTF  = "Higher-Timeframe Trend"
-useHTF  = input.bool(true,    "Require HTF Alignment",  group=gHTF)
-htfTF   = input.timeframe("15","HTF Timeframe",         group=gHTF)
-htfFast = input.int(20, "HTF Fast EMA", minval=5, group=gHTF)
-htfSlow = input.int(50, "HTF Slow EMA", minval=10,group=gHTF)
+gFilt = "Trend & Chop Filter"
+useHTF   = input.bool(true,    "Use HTF Trend Filter",      group=gFilt)
+htfTF    = input.timeframe("15","HTF Timeframe",            group=gFilt)
+htfFast  = input.int(20, "HTF Fast EMA", minval=5,  group=gFilt)
+htfSlow  = input.int(50, "HTF Slow EMA", minval=10, group=gFilt)
+useADX   = input.bool(true, "Skip Chop (ADX filter)",       group=gFilt)
+adxLen   = input.int(14, "ADX Length", minval=5, group=gFilt)
+adxMin   = input.float(18,"Min ADX to allow signal", minval=10, step=1, group=gFilt)
 
-gIdx = "Index Confirmation"
-useIdx = input.bool(false, "Confirm with Index Bias", group=gIdx)
-idxSym = input.symbol("NSE:NIFTY", "Index Symbol",    group=gIdx)
+gSes = "NSE Session (IST)"
+useSession = input.bool(true,"Restrict to NSE session", group=gSes)
+sessTrade  = input.session("0930-1500","Tradable Window", group=gSes)
+tz         = "Asia/Kolkata"
 
-gThr = "Probability Gate"
-minScore = input.int(75, "Min Score to Fire (0-100)", minval=50, maxval=100, group=gThr)
-cooldown = input.int(15, "Cooldown Bars Between Signals", minval=1, group=gThr)
-
-gRisk = "Risk / Trade Plan"
-riskAtr = input.float(1.2, "SL = ATR x", minval=0.3, step=0.1, group=gRisk)
-rr1     = input.float(1.0, "T1 R-Multiple", minval=0.5, step=0.1, group=gRisk)
-rr2     = input.float(2.0, "T2 R-Multiple", minval=0.5, step=0.1, group=gRisk)
-rr3     = input.float(3.0, "T3 R-Multiple", minval=0.5, step=0.1, group=gRisk)
-planLen = input.int(40, "Plan Lines Length (bars)", minval=10, group=gRisk)
+gRisk = "Risk / Targets"
+slBufferTicks = input.float(2.0, "SL Buffer (ticks)", minval=0, step=0.5, group=gRisk,
+     tooltip="Extra buffer beyond signal-candle wick")
+useStructTarget = input.bool(true,"Target = next structure level", group=gRisk)
+fallbackR1 = input.float(1.0,"Fallback T1 R-Multiple", minval=0.5, step=0.1, group=gRisk)
+fallbackR2 = input.float(2.0,"Fallback T2 R-Multiple", minval=0.5, step=0.1, group=gRisk)
+planLen   = input.int(40, "Plan Lines Length (bars)", minval=10, group=gRisk)
 
 gVis = "Visuals"
-showVWAP = input.bool(true, "Anchored VWAP + Bands",     group=gVis)
-showOR   = input.bool(true, "Opening Range",             group=gVis)
-showPlan = input.bool(true, "Trade Plan (SL/T1/T2/T3)",  group=gVis)
-showDash = input.bool(true, "Dashboard",                 group=gVis)
-showSqz  = input.bool(true, "Highlight Squeeze",         group=gVis)
-showBias = input.bool(true, "Plot EMA9 / EMA21",         group=gVis)
+showZones = input.bool(true,"Show Demand / Supply Zones", group=gVis)
+showPlan  = input.bool(true,"Show Trade Plan (E/SL/T1/T2)", group=gVis)
+showDash  = input.bool(true,"Show Dashboard",              group=gVis)
+showVWAP  = input.bool(true,"Show Anchored VWAP",          group=gVis)
 
-// ─── SESSION FLAGS ─────────────────────────────────────────────────────────
-tz       = "Asia/Kolkata"
-inFull   = not na(time(timeframe.period, sessFull,  tz))
-inOR     = not na(time(timeframe.period, sessOR,    tz))
-inTradeS = not na(time(timeframe.period, sessTrade, tz))
-inLunch  = not na(time(timeframe.period, sessLunch, tz))
-inTrade  = inTradeS and not (skipLunch and inLunch)
+// ─── HELPERS ───────────────────────────────────────────────────────────────
+atr     = ta.atr(14)
+mintick = syminfo.mintick
+rngBar  = high - low
+body    = math.abs(close - open)
+upWick  = high - math.max(close, open)
+loWick  = math.min(close, open) - low
 
-newSession = ta.change(time("D")) != 0
+inSession = not useSession or not na(time(timeframe.period, sessTrade, tz))
+newDay    = ta.change(time("D")) != 0
 
-// ─── OPENING RANGE ─────────────────────────────────────────────────────────
-var float orH = na
-var float orL = na
-if newSession
-    orH := na
-    orL := na
-if inOR
-    orH := na(orH) ? high : math.max(orH, high)
-    orL := na(orL) ? low  : math.min(orL, low)
-
-// ─── CORE INDICATORS ───────────────────────────────────────────────────────
-atr   = ta.atr(atrLen)
-basis = ta.sma(close, bbLen)
-dev   = ta.stdev(close, bbLen)
-bbU   = basis + bbMult * dev
-bbL   = basis - bbMult * dev
-kcU   = basis + kcMult * atr
-kcL   = basis - kcMult * atr
-squeeze = bbU < kcU and bbL > kcL
-sqzFire = squeeze[1] and not squeeze
-
-rng    = high - low
-nrN    = rng <= ta.lowest(rng, nrLook)
-inside = high <= high[1] and low >= low[1]
-compr  = nrN or inside
-
-vMA      = ta.sma(volume, volLen)
-rvol     = volume / math.max(vMA, 1)
-volReady = rvol >= rvolMin
-
-rsi = ta.rsi(close, 14)
-[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
-
-// Anchored VWAP from session start with std-dev bands
-[vwap, vwU1, vwL1] = ta.vwap(hlc3, newSession, 1.0)
-[_v2, vwU2, vwL2] = ta.vwap(hlc3, newSession, 2.0)
+[vwap, _vu, _vl] = ta.vwap(hlc3, newDay, 1.0)
 
 // HTF trend
-htfClose = request.security(syminfo.tickerid, htfTF, close,             lookahead=barmerge.lookahead_off)
-htfEmaF  = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfFast), lookahead=barmerge.lookahead_off)
-htfEmaS  = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfSlow), lookahead=barmerge.lookahead_off)
+htfEmaF = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfFast), lookahead=barmerge.lookahead_off)
+htfEmaS = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfSlow), lookahead=barmerge.lookahead_off)
+htfClose= request.security(syminfo.tickerid, htfTF, close, lookahead=barmerge.lookahead_off)
 htfUp = htfClose > htfEmaF and htfEmaF > htfEmaS
 htfDn = htfClose < htfEmaF and htfEmaF < htfEmaS
 
-// Index bias
-idxClose = request.security(idxSym, htfTF, close,                       lookahead=barmerge.lookahead_off)
-idxEmaF  = request.security(idxSym, htfTF, ta.ema(close, htfFast),      lookahead=barmerge.lookahead_off)
-idxUp = not useIdx or idxClose > idxEmaF
-idxDn = not useIdx or idxClose < idxEmaF
+// ADX
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+trendOk = not useADX or adx >= adxMin
 
-// Pivot Break-of-Structure
+// ─── ZONE BUILDER ──────────────────────────────────────────────────────────
 ph = ta.pivothigh(high, pivLen, pivLen)
 pl = ta.pivotlow(low,  pivLen, pivLen)
-var float lastPH = na
-var float lastPL = na
-if not na(ph)
-    lastPH := ph
+
+type Zone
+    box   bx
+    float top
+    float bot
+    int   touches
+    bool  isDemand
+
+var array<Zone> demandZones = array.new<Zone>()
+var array<Zone> supplyZones = array.new<Zone>()
+
+newDemand(float price, float a) =>
+    bot = price - a * zoneATR * 0.5
+    top = price + a * zoneATR * 0.5
+    bx  = showZones ? box.new(bar_index - pivLen, top, bar_index + 50, bot,
+              border_color=color.new(color.green, 40),
+              bgcolor=color.new(color.green, 85), extend=extend.right) : na
+    Zone.new(bx, top, bot, 0, true)
+
+newSupply(float price, float a) =>
+    bot = price - a * zoneATR * 0.5
+    top = price + a * zoneATR * 0.5
+    bx  = showZones ? box.new(bar_index - pivLen, top, bar_index + 50, bot,
+              border_color=color.new(color.red, 40),
+              bgcolor=color.new(color.red, 85), extend=extend.right) : na
+    Zone.new(bx, top, bot, 0, false)
+
 if not na(pl)
-    lastPL := pl
-bosUp = not na(lastPH) and close > lastPH and close[1] <= lastPH
-bosDn = not na(lastPL) and close < lastPL and close[1] >= lastPL
+    z = newDemand(pl, atr[pivLen])
+    array.unshift(demandZones, z)
+    while array.size(demandZones) > zoneKeep
+        old = array.pop(demandZones)
+        if not na(old.bx)
+            box.delete(old.bx)
 
-// Short EMA bias
-emaF = ta.ema(close, 9)
-emaS = ta.ema(close, 21)
-biasUp = close > vwap and emaF > emaS and close > emaF
-biasDn = close < vwap and emaF < emaS and close < emaF
+if not na(ph)
+    z = newSupply(ph, atr[pivLen])
+    array.unshift(supplyZones, z)
+    while array.size(supplyZones) > zoneKeep
+        old = array.pop(supplyZones)
+        if not na(old.bx)
+            box.delete(old.bx)
 
-// ORB break
-orbBuy  = not na(orH) and close > orH and close[1] <= orH
-orbSell = not na(orL) and close < orL and close[1] >= orL
+// Zone interaction lookups
+inDemand = false
+demTop = 0.0
+demBot = 0.0
+if array.size(demandZones) > 0
+    for i = 0 to array.size(demandZones) - 1
+        z = array.get(demandZones, i)
+        if z.touches < zoneTouchMax and low <= z.top and low >= z.bot - atr * 0.2
+            inDemand := true
+            demTop := z.top
+            demBot := z.bot
+            z.touches += 1
+            break
 
-// ─── PROBABILITY SCORE ─────────────────────────────────────────────────────
-upScore = 0
-upScore += biasUp                                   ? 15 : 0
-upScore += (htfUp or not useHTF)                    ? 15 : 0
-upScore += idxUp                                    ? 10 : 0
-upScore += sqzFire                                  ? 15 : 0
-upScore += compr                                    ? 10 : 0
-upScore += volReady                                 ? 15 : 0
-upScore += (bosUp or orbBuy)                        ? 15 : 0
-upScore += (rsi > 50 and rsi < 70 and macdHist > 0) ? 5  : 0
+inSupply = false
+supTop = 0.0
+supBot = 0.0
+if array.size(supplyZones) > 0
+    for i = 0 to array.size(supplyZones) - 1
+        z = array.get(supplyZones, i)
+        if z.touches < zoneTouchMax and high >= z.bot and high <= z.top + atr * 0.2
+            inSupply := true
+            supTop := z.top
+            supBot := z.bot
+            z.touches += 1
+            break
 
-dnScore = 0
-dnScore += biasDn                                   ? 15 : 0
-dnScore += (htfDn or not useHTF)                    ? 15 : 0
-dnScore += idxDn                                    ? 10 : 0
-dnScore += sqzFire                                  ? 15 : 0
-dnScore += compr                                    ? 10 : 0
-dnScore += volReady                                 ? 15 : 0
-dnScore += (bosDn or orbSell)                       ? 15 : 0
-dnScore += (rsi < 50 and rsi > 30 and macdHist < 0) ? 5  : 0
+// ─── REJECTION CANDLE PATTERNS ─────────────────────────────────────────────
+isBullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+isBearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+isHammer     = rngBar > 0 and loWick / rngBar >= minWickRatio and body / rngBar <= maxBodyRatio and close >= open
+isShooting   = rngBar > 0 and upWick / rngBar >= minWickRatio and body / rngBar <= maxBodyRatio and close <= open
+isPinBull    = rngBar > 0 and loWick >= rngBar * minWickRatio and close > (high + low) / 2
+isPinBear    = rngBar > 0 and upWick >= rngBar * minWickRatio and close < (high + low) / 2
 
-buySig  = inTrade and upScore >= minScore and upScore > dnScore
-sellSig = inTrade and dnScore >= minScore and dnScore > upScore
+bullCandle = needEngulf ? (isBullEngulf or isPinBull) : (isBullEngulf or isHammer or isPinBull)
+bearCandle = needEngulf ? (isBearEngulf or isPinBear) : (isBearEngulf or isShooting or isPinBear)
 
-var int lastBuyBar  = na
-var int lastSellBar = na
-buyTrigger  = buySig  and (na(lastBuyBar)  or bar_index - lastBuyBar  > cooldown)
-sellTrigger = sellSig and (na(lastSellBar) or bar_index - lastSellBar > cooldown)
-if buyTrigger
-    lastBuyBar  := bar_index
-if sellTrigger
-    lastSellBar := bar_index
+vMA      = ta.sma(volume, volLen)
+volSpike = volume >= vMA * volMult
+
+// ─── ENTRY GATES ───────────────────────────────────────────────────────────
+buyOk  = inSession and trendOk and inDemand and bullCandle and volSpike and (not useHTF or not htfDn)
+sellOk = inSession and trendOk and inSupply and bearCandle and volSpike and (not useHTF or not htfUp)
+
+// confirm only on bar close → no repaint
+buySignal  = barstate.isconfirmed and buyOk
+sellSignal = barstate.isconfirmed and sellOk
 
 // ─── TRADE PLAN ────────────────────────────────────────────────────────────
+nextSupply() =>
+    float t = na
+    if array.size(supplyZones) > 0
+        for i = 0 to array.size(supplyZones) - 1
+            z = array.get(supplyZones, i)
+            if z.bot > close
+                t := z.bot
+                break
+    t
+
+nextDemand() =>
+    float t = na
+    if array.size(demandZones) > 0
+        for i = 0 to array.size(demandZones) - 1
+            z = array.get(demandZones, i)
+            if z.top < close
+                t := z.top
+                break
+    t
+
 var float entryPx = na
 var float slPx    = na
 var float t1Px    = na
 var float t2Px    = na
-var float t3Px    = na
 var int   side    = 0
+var int   wins    = 0
+var int   losses  = 0
+var int   active  = 0   // 0 flat, 1 long, -1 short
 
-if buyTrigger
+if buySignal
     entryPx := close
-    slPx    := close - atr * riskAtr
+    slPx    := low - slBufferTicks * mintick
     rUnit   = entryPx - slPx
-    t1Px    := entryPx + rUnit * rr1
-    t2Px    := entryPx + rUnit * rr2
-    t3Px    := entryPx + rUnit * rr3
+    structT = nextSupply()
+    t1Px    := useStructTarget and not na(structT) ? structT : entryPx + rUnit * fallbackR1
+    t2Px    := entryPx + rUnit * fallbackR2
     side    := 1
-if sellTrigger
-    entryPx := close
-    slPx    := close + atr * riskAtr
-    rUnit   = slPx - entryPx
-    t1Px    := entryPx - rUnit * rr1
-    t2Px    := entryPx - rUnit * rr2
-    t3Px    := entryPx - rUnit * rr3
-    side    := -1
+    active  := 1
 
-if showPlan and (buyTrigger or sellTrigger)
-    cBuy = color.new(color.lime, 0)
-    cSell= color.new(color.red,  0)
-    col  = side == 1 ? cBuy : cSell
-    line.new(bar_index, entryPx, bar_index + planLen, entryPx, color=color.new(color.blue, 0),  width=2)
-    line.new(bar_index, slPx,    bar_index + planLen, slPx,    color=color.new(color.red,  0),  width=2, style=line.style_dashed)
-    line.new(bar_index, t1Px,    bar_index + planLen, t1Px,    color=color.new(color.green,40), width=1)
-    line.new(bar_index, t2Px,    bar_index + planLen, t2Px,    color=color.new(color.green,20), width=2)
-    line.new(bar_index, t3Px,    bar_index + planLen, t3Px,    color=color.new(color.green, 0), width=3)
-    label.new(bar_index + planLen, entryPx, "ENTRY " + str.tostring(entryPx, "#.##"), style=label.style_label_left, color=color.new(color.blue, 70),  textcolor=color.white, size=size.small)
-    label.new(bar_index + planLen, slPx,    "SL "    + str.tostring(slPx,    "#.##"), style=label.style_label_left, color=color.new(color.red,  70),  textcolor=color.white, size=size.small)
-    label.new(bar_index + planLen, t1Px,    "T1 "    + str.tostring(t1Px,    "#.##"), style=label.style_label_left, color=color.new(color.green,70),  textcolor=color.white, size=size.small)
-    label.new(bar_index + planLen, t2Px,    "T2 "    + str.tostring(t2Px,    "#.##"), style=label.style_label_left, color=color.new(color.green,55),  textcolor=color.white, size=size.small)
-    label.new(bar_index + planLen, t3Px,    "T3 "    + str.tostring(t3Px,    "#.##"), style=label.style_label_left, color=color.new(color.green,40),  textcolor=color.white, size=size.small)
+if sellSignal
+    entryPx := close
+    slPx    := high + slBufferTicks * mintick
+    rUnit   = slPx - entryPx
+    structT = nextDemand()
+    t1Px    := useStructTarget and not na(structT) ? structT : entryPx - rUnit * fallbackR1
+    t2Px    := entryPx - rUnit * fallbackR2
+    side    := -1
+    active  := -1
+
+// rough stat-tracking on chart bars (for dashboard only)
+if active == 1
+    if low <= slPx
+        losses += 1
+        active := 0
+    else if high >= t1Px
+        wins += 1
+        active := 0
+if active == -1
+    if high >= slPx
+        losses += 1
+        active := 0
+    else if low <= t1Px
+        wins += 1
+        active := 0
+
+if showPlan and (buySignal or sellSignal)
+    line.new(bar_index, entryPx, bar_index + planLen, entryPx,
+         color=color.new(color.blue, 0), width=2)
+    line.new(bar_index, slPx,    bar_index + planLen, slPx,
+         color=color.new(color.red, 0),  width=2, style=line.style_dashed)
+    line.new(bar_index, t1Px,    bar_index + planLen, t1Px,
+         color=color.new(color.green, 20), width=2)
+    line.new(bar_index, t2Px,    bar_index + planLen, t2Px,
+         color=color.new(color.green, 0), width=3)
+    label.new(bar_index + planLen, entryPx, "ENTRY " + str.tostring(entryPx, "#.##"),
+         style=label.style_label_left, color=color.new(color.blue, 70),
+         textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, slPx,    "SL "    + str.tostring(slPx, "#.##"),
+         style=label.style_label_left, color=color.new(color.red, 70),
+         textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, t1Px,    "T1 "    + str.tostring(t1Px, "#.##"),
+         style=label.style_label_left, color=color.new(color.green, 60),
+         textcolor=color.white, size=size.small)
+    label.new(bar_index + planLen, t2Px,    "T2 "    + str.tostring(t2Px, "#.##"),
+         style=label.style_label_left, color=color.new(color.green, 40),
+         textcolor=color.white, size=size.small)
 
 // ─── PLOTS ─────────────────────────────────────────────────────────────────
-plot(showBias ? emaF : na, "EMA9",  color=color.new(color.aqua,   0))
-plot(showBias ? emaS : na, "EMA21", color=color.new(color.orange, 0))
+plot(showVWAP ? vwap : na, "VWAP", color=color.new(color.yellow, 0), linewidth=2)
 
-plot(showVWAP ? vwap : na, "VWAP",     color=color.new(color.yellow, 0), linewidth=2)
-plot(showVWAP ? vwU1 : na, "VWAP +1σ", color=color.new(color.yellow,70))
-plot(showVWAP ? vwL1 : na, "VWAP -1σ", color=color.new(color.yellow,70))
-plot(showVWAP ? vwU2 : na, "VWAP +2σ", color=color.new(color.yellow,50))
-plot(showVWAP ? vwL2 : na, "VWAP -2σ", color=color.new(color.yellow,50))
+plotshape(buySignal,  "BUY",  shape.labelup,   location.belowbar,
+     color=color.new(color.lime, 0), text="BUY",  textcolor=color.black, size=size.normal)
+plotshape(sellSignal, "SELL", shape.labeldown, location.abovebar,
+     color=color.new(color.red, 0),  text="SELL", textcolor=color.white, size=size.normal)
 
-plot(showOR ? orH : na, "OR High", color=color.new(color.aqua,    0), style=plot.style_linebr, linewidth=2)
-plot(showOR ? orL : na, "OR Low",  color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=2)
-
-p1 = plot(bbU, "BB Upper", color=color.new(color.gray, 75))
-p2 = plot(bbL, "BB Lower", color=color.new(color.gray, 75))
-fill(p1, p2, color=showSqz and squeeze ? color.new(color.yellow, 88) : na)
-
-bgcolor(showSqz and squeeze ? color.new(color.yellow, 92) : na, title="Squeeze BG")
-bgcolor(showSqz and sqzFire ? color.new(color.orange, 80) : na, title="Squeeze Fire")
-bgcolor(not inTrade and inFull ? color.new(color.gray, 92) : na, title="No-Trade Window")
-
-plotshape(buyTrigger,  "BUY GEM",  shape.labelup,   location.belowbar,
-     color=color.new(color.lime, 0), text="BUY GEM",  textcolor=color.black, size=size.normal)
-plotshape(sellTrigger, "SELL GEM", shape.labeldown, location.abovebar,
-     color=color.new(color.red,  0), text="SELL GEM", textcolor=color.white, size=size.normal)
-
-if buyTrigger
-    label.new(bar_index, low  - atr * 0.6,
-         text="P=" + str.tostring(upScore) + "%  RVOL " + str.tostring(rvol, "#.#") + "x",
-         style=label.style_label_up, color=color.new(color.black, 30),
-         textcolor=color.lime, size=size.small)
-if sellTrigger
-    label.new(bar_index, high + atr * 0.6,
-         text="P=" + str.tostring(dnScore) + "%  RVOL " + str.tostring(rvol, "#.#") + "x",
-         style=label.style_label_down, color=color.new(color.black, 30),
-         textcolor=color.red, size=size.small)
+// Zone-touch highlight
+bgcolor(inDemand ? color.new(color.green, 92) : na, title="In Demand")
+bgcolor(inSupply ? color.new(color.red,   92) : na, title="In Supply")
 
 // ─── DASHBOARD ─────────────────────────────────────────────────────────────
-var table dash = table.new(position.top_right, 2, 10, border_width=1)
+var table dash = table.new(position.top_right, 2, 8, border_width=1)
 if showDash and barstate.islast
-    bUp = upScore  >= minScore
-    bDn = dnScore  >= minScore
-    table.cell(dash, 0, 0, "GEM Catcher Pro",     bgcolor=color.new(color.navy, 0), text_color=color.white,  text_size=size.normal)
-    table.cell(dash, 1, 0, syminfo.ticker,        bgcolor=color.new(color.navy, 0), text_color=color.yellow, text_size=size.normal)
-    table.cell(dash, 0, 1, "Bias",                bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 1, biasUp ? "LONG" : biasDn ? "SHORT" : "FLAT",
-         bgcolor=biasUp ? color.green : biasDn ? color.red : color.gray, text_color=color.white)
-    table.cell(dash, 0, 2, "HTF " + htfTF,        bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 2, htfUp ? "UP" : htfDn ? "DOWN" : "FLAT",
+    total = wins + losses
+    wr    = total > 0 ? math.round(wins * 100.0 / total) : 0
+    table.cell(dash, 0, 0, "AI Reversal", bgcolor=color.new(color.navy, 0), text_color=color.white,  text_size=size.normal)
+    table.cell(dash, 1, 0, syminfo.ticker, bgcolor=color.new(color.navy, 0), text_color=color.yellow, text_size=size.normal)
+    table.cell(dash, 0, 1, "HTF " + htfTF, bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 1, htfUp ? "UP" : htfDn ? "DOWN" : "FLAT",
          bgcolor=htfUp ? color.green : htfDn ? color.red : color.gray, text_color=color.white)
-    table.cell(dash, 0, 3, "Up Score",            bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 3, str.tostring(upScore), bgcolor=bUp ? color.green : color.new(color.gray, 30), text_color=color.white)
-    table.cell(dash, 0, 4, "Dn Score",            bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 4, str.tostring(dnScore), bgcolor=bDn ? color.red : color.new(color.gray, 30), text_color=color.white)
-    table.cell(dash, 0, 5, "RVOL",                bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 5, str.tostring(rvol, "#.##") + "x",
-         bgcolor=volReady ? color.green : color.new(color.gray, 30), text_color=color.white)
-    table.cell(dash, 0, 6, "ATR",                 bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 6, str.tostring(atr, "#.##"), bgcolor=color.black, text_color=color.white)
-    table.cell(dash, 0, 7, "Squeeze",             bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 7, squeeze ? "ON" : sqzFire ? "FIRED" : "OFF",
-         bgcolor=squeeze ? color.yellow : sqzFire ? color.orange : color.new(color.gray, 30), text_color=color.black)
-    table.cell(dash, 0, 8, "Window",              bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 8, inTrade ? "TRADE OK" : "NO-TRADE",
-         bgcolor=inTrade ? color.green : color.red, text_color=color.white)
-    table.cell(dash, 0, 9, "Last Side",           bgcolor=color.new(color.gray, 60), text_color=color.white)
-    table.cell(dash, 1, 9, side == 1 ? "LONG @ " + str.tostring(entryPx, "#.##") : side == -1 ? "SHORT @ " + str.tostring(entryPx, "#.##") : "—",
-         bgcolor=side == 1 ? color.new(color.green, 40) : side == -1 ? color.new(color.red, 40) : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 2, "ADX", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(adx, "#.#"),
+         bgcolor=trendOk ? color.green : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 3, "Zone", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 3, inDemand ? "DEMAND" : inSupply ? "SUPPLY" : "—",
+         bgcolor=inDemand ? color.green : inSupply ? color.red : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 4, "Active", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 4, active == 1 ? "LONG" : active == -1 ? "SHORT" : "FLAT",
+         bgcolor=active == 1 ? color.green : active == -1 ? color.red : color.new(color.gray, 30), text_color=color.white)
+    table.cell(dash, 0, 5, "Entry", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 5, na(entryPx) ? "—" : str.tostring(entryPx, "#.##"), bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 0, 6, "Wins / Losses", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(wins) + " / " + str.tostring(losses), bgcolor=color.black, text_color=color.white)
+    table.cell(dash, 0, 7, "WinRate", bgcolor=color.new(color.gray, 60), text_color=color.white)
+    table.cell(dash, 1, 7, str.tostring(wr) + "%",
+         bgcolor=wr >= 60 ? color.green : wr >= 45 ? color.orange : color.new(color.gray, 30),
+         text_color=color.white)
 
 // ─── ALERTS ────────────────────────────────────────────────────────────────
-alertcondition(buyTrigger,  title="GEM BUY",
-     message='{"sym":"{{ticker}}","side":"BUY","px":{{close}},"score":"see chart","plan":"SL/T1/T2/T3 on chart"}')
-alertcondition(sellTrigger, title="GEM SELL",
-     message='{"sym":"{{ticker}}","side":"SELL","px":{{close}},"score":"see chart","plan":"SL/T1/T2/T3 on chart"}')
+alertcondition(buySignal,  title="AI BUY",
+     message='AI BUY {{ticker}} @ {{close}} — rejection from demand zone, see chart for SL / T1 / T2')
+alertcondition(sellSignal, title="AI SELL",
+     message='AI SELL {{ticker}} @ {{close}} — rejection from supply zone, see chart for SL / T1 / T2')
 
-if buyTrigger
-    alert("GEM BUY " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
+if buySignal
+    alert("AI BUY " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
          " | SL " + str.tostring(slPx, "#.##") +
          " | T1 " + str.tostring(t1Px, "#.##") +
-         " | T2 " + str.tostring(t2Px, "#.##") +
-         " | T3 " + str.tostring(t3Px, "#.##") +
-         " | P=" + str.tostring(upScore) + "%",
+         " | T2 " + str.tostring(t2Px, "#.##"),
          alert.freq_once_per_bar_close)
-if sellTrigger
-    alert("GEM SELL " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
+if sellSignal
+    alert("AI SELL " + syminfo.ticker + " @ " + str.tostring(close, "#.##") +
          " | SL " + str.tostring(slPx, "#.##") +
          " | T1 " + str.tostring(t1Px, "#.##") +
-         " | T2 " + str.tostring(t2Px, "#.##") +
-         " | T3 " + str.tostring(t3Px, "#.##") +
-         " | P=" + str.tostring(dnScore) + "%",
+         " | T2 " + str.tostring(t2Px, "#.##"),
          alert.freq_once_per_bar_close)
