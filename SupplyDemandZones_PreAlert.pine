@@ -290,17 +290,15 @@ alert_ds(_do, _zone_type, _s1, _s1_time, _alert_type) =>
         if not _repeatAlert
             add_ds_alert(_zone_type, _time_unix, _s1)
     if _do and not _repeatAlert
-        // Confirmation gate for HIT alerts
-        if _alert_type == 'H' and confirmHit
-            bool reactive = _zone_type == 'D' ? demReact : supReact
-            if not reactive
-                // skip non-reactive hit
-            else
+        bool isHit = _alert_type == 'H'
+        bool reactive = _zone_type == 'D' ? demReact : supReact
+        if isHit and confirmHit
+            if reactive
                 _msg = 'CONFIRMED ' + (_zone_type == 'D' ? 'DEMAND HIT - Move UP Likely' : 'SUPPLY HIT - Move DOWN Likely')
                 _msg += '\n' + get_ds_zone_info(_zone_type, _s1, _s1_time)
                 alert(_msg)
         else
-            _msg = _alert_type == 'H' ? (_zone_type == 'D' ? 'Demand Zone HIT' : 'Supply Zone HIT') : (_zone_type == 'D' ? 'Demand Zone NEAR' : 'Supply Zone NEAR')
+            _msg = isHit ? (_zone_type == 'D' ? 'Demand Zone HIT' : 'Supply Zone HIT') : (_zone_type == 'D' ? 'Demand Zone NEAR' : 'Supply Zone NEAR')
             _msg += '\n' + get_ds_zone_info(_zone_type, _s1, _s1_time)
             alert(_msg)
 
