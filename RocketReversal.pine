@@ -1,0 +1,248 @@
+//@version=5
+// =============================================================================
+//  ROCKET REVERSAL - Top & Bottom Sniper (Intraday)
+//  Confirmed reversal detection at swing highs / lows.
+//  Non-repainting: signal appears on the bar AFTER the reversal candle.
+//  Auto-plots Entry / SL / TP1 / TP2 / TP3 with R:R alerts.
+// =============================================================================
+indicator("ROCKET REVERSAL - Top & Bottom Sniper", shorttitle="ROCKET REV", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// -----------------------------------------------------------------------------
+//  INPUTS
+// -----------------------------------------------------------------------------
+gC = "Reversal Detection"
+sweepLB   = input.int(10,  "Sweep Lookback (bars)",            minval=2,   group=gC)
+wickPct   = input.float(0.55,"Min Rejection Wick / Range",     minval=0.3, maxval=0.95, step=0.05, group=gC)
+volLen    = input.int(20,  "Volume SMA Length",                 minval=2,   group=gC)
+volMult   = input.float(1.4,"Min Volume x SMA",                minval=1.0, step=0.1, group=gC)
+useRSI    = input.bool(true,"Use RSI Filter",                  group=gC)
+rsiLen    = input.int(14,  "RSI Length",                        minval=2,   group=gC)
+rsiOB     = input.float(68,"RSI Overbought (top)",             minval=50,  step=1, group=gC)
+rsiOS     = input.float(32,"RSI Oversold (bottom)",            maxval=50,  step=1, group=gC)
+useDiv    = input.bool(false,"Require RSI Divergence (stricter)", group=gC)
+divLB     = input.int(20,  "Divergence Lookback",              minval=5,   group=gC)
+useEng    = input.bool(false,"Require Bearish/Bullish Engulfing (stricter)", group=gC)
+
+gR = "Risk Management"
+atrLen    = input.int(14,   "ATR Length",                       minval=2,   group=gR)
+atrSLBuf  = input.float(0.4,"SL Buffer x ATR",                 minval=0,   step=0.1, group=gR)
+rr1       = input.float(1.0,"TP1 Risk:Reward",                  minval=0.5, step=0.5, group=gR)
+rr2       = input.float(2.0,"TP2 Risk:Reward",                  minval=0.5, step=0.5, group=gR)
+rr3       = input.float(3.0,"TP3 Risk:Reward",                  minval=0.5, step=0.5, group=gR)
+
+gV = "Visuals"
+showSLTP    = input.bool(true,  "Show SL / TP Lines",          group=gV)
+showLabels  = input.bool(true,  "Show Price Labels",           group=gV)
+extendBars  = input.int(30,    "Extend Lines Right (bars)",    minval=5, group=gV)
+trackActive = input.bool(true,  "Track Trade & Fire SL/TP Alerts", group=gV)
+
+// -----------------------------------------------------------------------------
+//  CORE CALCS
+// -----------------------------------------------------------------------------
+atrV   = ta.atr(atrLen)
+volA   = ta.sma(volume, volLen)
+rsiV   = ta.rsi(close, rsiLen)
+rng    = high - low
+upWick = high - math.max(close, open)
+dnWick = math.min(close, open) - low
+
+// Candidate reversal candle = bar [1] (i.e. previous bar). Confirmation = current bar.
+candHigh = high[1]
+candLow  = low[1]
+candOpen = open[1]
+candClose= close[1]
+candRng  = rng[1]
+candUpWick = upWick[1]
+candDnWick = dnWick[1]
+
+// 1. Liquidity sweep — broke recent extreme on the candidate bar
+priorHigh = ta.highest(high, sweepLB)[2]
+priorLow  = ta.lowest(low,  sweepLB)[2]
+sweepH = (not na(priorHigh)) and candHigh > priorHigh
+sweepL = (not na(priorLow))  and candLow  < priorLow
+
+// 2. Strong rejection wick on the candidate
+wickTop = candRng > 0 and candUpWick >= candRng * wickPct
+wickBot = candRng > 0 and candDnWick >= candRng * wickPct
+
+// 3. Volume spike on the candidate
+volOK = volume[1] >= volA[1] * volMult
+
+// 4. RSI extreme on the candidate
+rsiTopOK = (not useRSI) or rsiV[1] >= rsiOB
+rsiBotOK = (not useRSI) or rsiV[1] <= rsiOS
+
+// 5. Optional: RSI divergence
+//    Bearish: candidate makes higher high than divLB-window high but RSI does not
+//    Bullish: candidate makes lower low than divLB-window low but RSI does not
+priorHHDiv = ta.highest(high, divLB)[2]
+priorLLDiv = ta.lowest(low,  divLB)[2]
+priorRSIH  = ta.highest(rsiV, divLB)[2]
+priorRSIL  = ta.lowest(rsiV,  divLB)[2]
+bearDiv = (not useDiv) or ((not na(priorHHDiv)) and candHigh >= priorHHDiv and rsiV[1] < priorRSIH)
+bullDiv = (not useDiv) or ((not na(priorLLDiv)) and candLow  <= priorLLDiv and rsiV[1] > priorRSIL)
+
+// 6. Optional: engulfing pattern on candidate (bar [1] vs bar [2])
+bearEng = (not useEng) or (candClose < candOpen and close[2] > open[2] and candOpen >= close[2] and candClose <= open[2])
+bullEng = (not useEng) or (candClose > candOpen and close[2] < open[2] and candOpen <= close[2] and candClose >= open[2])
+
+// 7. Confirmation on current bar — close beyond candidate body in reversal direction
+candBodyLow  = math.min(candOpen, candClose)
+candBodyHigh = math.max(candOpen, candClose)
+confirmTop = close < candBodyLow
+confirmBot = close > candBodyHigh
+
+isTop = barstate.isconfirmed and sweepH and wickTop and volOK and rsiTopOK and bearDiv and bearEng and confirmTop
+isBot = barstate.isconfirmed and sweepL and wickBot and volOK and rsiBotOK and bullDiv and bullEng and confirmBot
+
+// -----------------------------------------------------------------------------
+//  TRADE PLAN  (Entry = current close on confirmation bar)
+// -----------------------------------------------------------------------------
+slShort = candHigh + atrV * atrSLBuf
+slLong  = candLow  - atrV * atrSLBuf
+entryShort = close
+entryLong  = close
+riskShort = slShort - entryShort
+riskLong  = entryLong - slLong
+
+tp1Short = entryShort - riskShort * rr1
+tp2Short = entryShort - riskShort * rr2
+tp3Short = entryShort - riskShort * rr3
+tp1Long  = entryLong  + riskLong  * rr1
+tp2Long  = entryLong  + riskLong  * rr2
+tp3Long  = entryLong  + riskLong  * rr3
+
+// -----------------------------------------------------------------------------
+//  PLOT SIGNALS
+// -----------------------------------------------------------------------------
+plotshape(isTop, "Top Reversal", style=shape.triangledown, location=location.abovebar, color=color.new(#ff1744, 0), size=size.normal, text="TOP", textcolor=color.white)
+plotshape(isBot, "Bottom Reversal", style=shape.triangleup, location=location.belowbar, color=color.new(#00e676, 0), size=size.normal, text="BOT", textcolor=color.white)
+
+f_drawTrade(bool _short, float _entry, float _sl, float _tp1, float _tp2, float _tp3) =>
+    color slC  = color.new(#ff1744, 0)
+    color tpC  = color.new(#00e676, 0)
+    color enC  = color.new(#ffeb3b, 0)
+    int   rX   = bar_index + extendBars
+    line.new(bar_index, _entry, rX, _entry, color=enC, width=2, style=line.style_solid)
+    line.new(bar_index, _sl,    rX, _sl,    color=slC, width=2, style=line.style_solid)
+    line.new(bar_index, _tp1,   rX, _tp1,   color=tpC, width=1, style=line.style_dashed)
+    line.new(bar_index, _tp2,   rX, _tp2,   color=tpC, width=1, style=line.style_dashed)
+    line.new(bar_index, _tp3,   rX, _tp3,   color=tpC, width=1, style=line.style_dashed)
+    if showLabels
+        string side = _short ? "SHORT" : "LONG"
+        label.new(rX, _entry, side + " " + str.tostring(_entry, "#.##"), color=enC, textcolor=color.black, style=label.style_label_left, size=size.small)
+        label.new(rX, _sl,    "SL "  + str.tostring(_sl,    "#.##"), color=slC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(rX, _tp1,   "TP1 " + str.tostring(_tp1,   "#.##"), color=tpC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(rX, _tp2,   "TP2 " + str.tostring(_tp2,   "#.##"), color=tpC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(rX, _tp3,   "TP3 " + str.tostring(_tp3,   "#.##"), color=tpC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+if isTop and showSLTP
+    f_drawTrade(true,  entryShort, slShort, tp1Short, tp2Short, tp3Short)
+if isBot and showSLTP
+    f_drawTrade(false, entryLong,  slLong,  tp1Long,  tp2Long,  tp3Long)
+
+// -----------------------------------------------------------------------------
+//  TRADE TRACKING (active SL / TP hit alerts)
+// -----------------------------------------------------------------------------
+var float aShortEntry = na
+var float aShortSL    = na
+var float aShortTP1   = na
+var float aShortTP2   = na
+var float aShortTP3   = na
+var bool  aShortTP1Hit= false
+var bool  aShortTP2Hit= false
+var float aLongEntry  = na
+var float aLongSL     = na
+var float aLongTP1    = na
+var float aLongTP2    = na
+var float aLongTP3    = na
+var bool  aLongTP1Hit = false
+var bool  aLongTP2Hit = false
+
+if isTop
+    aShortEntry := entryShort
+    aShortSL    := slShort
+    aShortTP1   := tp1Short
+    aShortTP2   := tp2Short
+    aShortTP3   := tp3Short
+    aShortTP1Hit:= false
+    aShortTP2Hit:= false
+if isBot
+    aLongEntry  := entryLong
+    aLongSL     := slLong
+    aLongTP1    := tp1Long
+    aLongTP2    := tp2Long
+    aLongTP3    := tp3Long
+    aLongTP1Hit := false
+    aLongTP2Hit := false
+
+bool shortSLHit  = trackActive and (not na(aShortEntry)) and high >= aShortSL
+bool shortTP1Hit = trackActive and (not na(aShortEntry)) and (not aShortTP1Hit) and low <= aShortTP1
+bool shortTP2Hit = trackActive and (not na(aShortEntry)) and (not aShortTP2Hit) and low <= aShortTP2
+bool shortTP3Hit = trackActive and (not na(aShortEntry)) and low <= aShortTP3
+bool longSLHit   = trackActive and (not na(aLongEntry))  and low  <= aLongSL
+bool longTP1Hit  = trackActive and (not na(aLongEntry))  and (not aLongTP1Hit) and high >= aLongTP1
+bool longTP2Hit  = trackActive and (not na(aLongEntry))  and (not aLongTP2Hit) and high >= aLongTP2
+bool longTP3Hit  = trackActive and (not na(aLongEntry))  and high >= aLongTP3
+
+if shortTP1Hit
+    aShortTP1Hit := true
+if shortTP2Hit
+    aShortTP2Hit := true
+if longTP1Hit
+    aLongTP1Hit := true
+if longTP2Hit
+    aLongTP2Hit := true
+
+if shortSLHit or shortTP3Hit
+    aShortEntry := na
+    aShortSL    := na
+    aShortTP1   := na
+    aShortTP2   := na
+    aShortTP3   := na
+if longSLHit or longTP3Hit
+    aLongEntry := na
+    aLongSL    := na
+    aLongTP1   := na
+    aLongTP2   := na
+    aLongTP3   := na
+
+// -----------------------------------------------------------------------------
+//  ALERTS
+// -----------------------------------------------------------------------------
+if isTop
+    alert("ROCKET TOP REVERSAL - SHORT @ " + str.tostring(entryShort, "#.##") + " | SL " + str.tostring(slShort, "#.##") + " | TP1 " + str.tostring(tp1Short, "#.##") + " | TP2 " + str.tostring(tp2Short, "#.##") + " | TP3 " + str.tostring(tp3Short, "#.##"), alert.freq_once_per_bar)
+if isBot
+    alert("ROCKET BOTTOM REVERSAL - LONG @ " + str.tostring(entryLong, "#.##") + " | SL " + str.tostring(slLong, "#.##") + " | TP1 " + str.tostring(tp1Long, "#.##") + " | TP2 " + str.tostring(tp2Long, "#.##") + " | TP3 " + str.tostring(tp3Long, "#.##"), alert.freq_once_per_bar)
+
+if shortTP1Hit
+    alert("SHORT TP1 HIT (1R) - Move SL to Entry", alert.freq_once_per_bar)
+if shortTP2Hit
+    alert("SHORT TP2 HIT (2R) - Trail SL", alert.freq_once_per_bar)
+if shortTP3Hit
+    alert("SHORT TP3 HIT (3R) - Full Profit", alert.freq_once_per_bar)
+if shortSLHit
+    alert("SHORT STOP-LOSS HIT", alert.freq_once_per_bar)
+if longTP1Hit
+    alert("LONG TP1 HIT (1R) - Move SL to Entry", alert.freq_once_per_bar)
+if longTP2Hit
+    alert("LONG TP2 HIT (2R) - Trail SL", alert.freq_once_per_bar)
+if longTP3Hit
+    alert("LONG TP3 HIT (3R) - Full Profit", alert.freq_once_per_bar)
+if longSLHit
+    alert("LONG STOP-LOSS HIT", alert.freq_once_per_bar)
+
+alertcondition(isTop, title="Top Reversal", message="ROCKET TOP REVERSAL detected - SHORT setup ready")
+alertcondition(isBot, title="Bottom Reversal", message="ROCKET BOTTOM REVERSAL detected - LONG setup ready")
+alertcondition(shortTP1Hit, title="Short TP1", message="SHORT TP1 HIT (1R)")
+alertcondition(shortTP2Hit, title="Short TP2", message="SHORT TP2 HIT (2R)")
+alertcondition(shortTP3Hit, title="Short TP3", message="SHORT TP3 HIT (3R)")
+alertcondition(shortSLHit,  title="Short SL",  message="SHORT STOP-LOSS HIT")
+alertcondition(longTP1Hit,  title="Long TP1",  message="LONG TP1 HIT (1R)")
+alertcondition(longTP2Hit,  title="Long TP2",  message="LONG TP2 HIT (2R)")
+alertcondition(longTP3Hit,  title="Long TP3",  message="LONG TP3 HIT (3R)")
+alertcondition(longSLHit,   title="Long SL",   message="LONG STOP-LOSS HIT")
+
+// =============================================================================
+//  END
+// =============================================================================
