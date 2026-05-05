@@ -164,10 +164,10 @@ f_clear(Zone z) =>
 f_draw(bool _buy, float _t, float _b) =>
     color  fill   = _buy ? buyFill : sellFill
     color  border = _buy ? buyBord : sellBord
-    int    rightX = extendRight ? bar_index + 5000 : bar_index + 30
+    int    rightX = bar_index + 30
     box    bx     = box.new(left=bar_index, top=_t, right=rightX, bottom=_b,
                      border_color=border, border_width=2, bgcolor=fill,
-                     extend=extend.none)
+                     extend=extendRight ? extend.right : extend.none)
     label  lb     = na
     if zoneLabel
         string txt = _buy ? buyTxt : sellTxt
