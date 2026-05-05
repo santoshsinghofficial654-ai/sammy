@@ -2,104 +2,81 @@
 // =============================================================================
 //  Institutional Supply & Demand Zones  -  NSE Intraday (Nifty 500)
 //  Pine Script v5  |  Non-repainting  |  Overlay
-//
-//  Engine logic (multi-confluence "smart-money" gate):
-//    1. Explosive displacement candle  (range > ATR x mult)
-//    2. Strong body / range ratio       (institutional commitment)
-//    3. Relative volume spike           (smart-money footprint)
-//    4. 3-candle Fair Value Gap (FVG)   (price imbalance)
-//    5. Break of Structure (BOS/CHOCH)  (intent confirmation)
-//    6. Liquidity sweep wick            (stops taken, reversal fuel)
-//    7. Optional VWAP / EMA / PDHL / CPR / HTF confluence
-//
-//  Zones are drawn ONLY on confirmed bar close (barstate.isconfirmed)
-//  using historical OHLC -> never repaint, never float.
-//
-//  A zone is upgraded to "SUPER" when ALL of: BOS in same direction,
-//  FVG present, hard volume spike, and HTF candle agrees.
-//
-//  Entry markers (BUY / SELL) print the FIRST time price tags a fresh
-//  zone AND prints a confirmed rejection candle inside it.
+//  Every multi-arg call is on a single line to avoid continuation issues.
 // =============================================================================
-
-indicator("Institutional Supply & Demand Zones [NSE Intraday]",
-     shorttitle="INST S/D",
-     overlay=true,
-     max_boxes_count=500,
-     max_lines_count=500,
-     max_labels_count=500)
+indicator("Institutional Supply & Demand Zones [NSE Intraday]", shorttitle="INST S/D", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
 
 // -----------------------------------------------------------------------------
-//  INPUTS
+// INPUTS
 // -----------------------------------------------------------------------------
 gCore   = "Core Detection"
-atrLen  = input.int(14,   "ATR Length",                  minval=2,   group=gCore)
-atrMult = input.float(1.6,"Displacement: Range > ATR ×", minval=0.5, step=0.1, group=gCore)
-bodyPct = input.float(0.6,"Min Body / Range Ratio",      minval=0.1, maxval=1.0, step=0.05, group=gCore)
-volLen  = input.int(20,   "Volume MA Length",            minval=2,   group=gCore)
-volMult = input.float(1.5,"Volume Spike × MA",           minval=1.0, step=0.1, group=gCore)
-pivLen  = input.int(5,    "Structure Pivot Length",      minval=2,   group=gCore)
+atrLen  = input.int(14,    "ATR Length", minval=2, group=gCore)
+atrMult = input.float(1.6, "Displacement: Range > ATR x", minval=0.5, step=0.1, group=gCore)
+bodyPct = input.float(0.6, "Min Body / Range Ratio", minval=0.1, maxval=1.0, step=0.05, group=gCore)
+volLen  = input.int(20,    "Volume MA Length", minval=2, group=gCore)
+volMult = input.float(1.5, "Volume Spike x MA", minval=1.0, step=0.1, group=gCore)
+pivLen  = input.int(5,     "Structure Pivot Length", minval=2, group=gCore)
 
 gFlt    = "Filters"
-useVol  = input.bool(true, "Volume Filter",                                group=gFlt)
-useFVG  = input.bool(true, "Fair Value Gap (Imbalance)",                   group=gFlt)
-useBOS  = input.bool(true, "Break of Structure / CHOCH",                   group=gFlt)
-useWick = input.bool(true, "Liquidity Sweep Wick",                         group=gFlt)
-wickPct = input.float(0.4, "Min Sweep Wick / Range",  minval=0.05, step=0.05, group=gFlt)
+useVol  = input.bool(true, "Volume Filter", group=gFlt)
+useFVG  = input.bool(true, "Fair Value Gap (Imbalance)", group=gFlt)
+useBOS  = input.bool(true, "Break of Structure / CHOCH", group=gFlt)
+useWick = input.bool(true, "Liquidity Sweep Wick", group=gFlt)
+wickPct = input.float(0.4, "Min Sweep Wick / Range", minval=0.05, step=0.05, group=gFlt)
 
 gConf   = "Confluence"
-useVWAP = input.bool(false,"VWAP Side Alignment",        group=gConf)
-useEMA  = input.bool(false,"EMA 20 / 50 Trend",          group=gConf)
-usePDHL = input.bool(false,"Previous Day High / Low",    group=gConf)
-useCPR  = input.bool(false,"CPR Confluence",             group=gConf)
-useHTF  = input.bool(true, "HTF Alignment for SUPER tag",group=gConf)
-htfRes  = input.timeframe("60","HTF Resolution",         group=gConf)
+useVWAP = input.bool(false, "VWAP Side Alignment", group=gConf)
+useEMA  = input.bool(false, "EMA 20 / 50 Trend", group=gConf)
+usePDHL = input.bool(false, "Previous Day High / Low", group=gConf)
+useCPR  = input.bool(false, "CPR Confluence", group=gConf)
+useHTF  = input.bool(true,  "HTF Alignment for SUPER tag", group=gConf)
+htfRes  = input.timeframe("60", "HTF Resolution", group=gConf)
 
 gSess   = "Session (NSE Intraday)"
-useSess = input.bool(true, "Detect Only In Session",                       group=gSess)
-sessStr = input.session("0915-1500","Active Session (Exchange TZ)",        group=gSess)
+useSess = input.bool(true, "Detect Only In Session", group=gSess)
+sessStr = input.session("0915-1500", "Active Session (Exchange TZ)", group=gSess)
 
 gZone   = "Zone Behaviour"
-intraOnly      = input.bool(true,"Auto-Expire On New Day",   group=gZone)
-freshOnly      = input.bool(true,"Fade Already-Tested Zones",group=gZone)
-invalidOnClose = input.bool(true,"Invalidate If Close Beyond Zone", group=gZone)
-extendRight    = input.bool(true,"Extend Zones Right",       group=gZone)
-showMid        = input.bool(true,"Show Equilibrium (50 %)",  group=gZone)
-maxPerSide     = input.int(6,"Max Active Zones / Side",      minval=1, maxval=20, group=gZone)
+intraOnly      = input.bool(true, "Auto-Expire On New Day", group=gZone)
+freshOnly      = input.bool(true, "Fade Already-Tested Zones", group=gZone)
+invalidOnClose = input.bool(true, "Invalidate If Close Beyond Zone", group=gZone)
+extendRight    = input.bool(true, "Extend Zones Right", group=gZone)
+showMid        = input.bool(true, "Show Equilibrium (50%)", group=gZone)
+maxPerSide     = input.int(6, "Max Active Zones / Side", minval=1, maxval=20, group=gZone)
 
 gEntry  = "Entry Markers"
-showEntry = input.bool(true, "Show BUY / SELL Markers",      group=gEntry)
-showSLTP  = input.bool(true, "Plot SL / TP Levels",          group=gEntry)
-rrTarget  = input.float(2.0, "Risk : Reward Target",  minval=1.0, step=0.5, group=gEntry)
+showEntry = input.bool(true, "Show BUY / SELL Markers", group=gEntry)
+showSLTP  = input.bool(true, "Plot SL / TP Levels", group=gEntry)
+rrTarget  = input.float(2.0, "Risk : Reward Target", minval=1.0, step=0.5, group=gEntry)
 
 gAlert  = "Alerts"
-alertTouch = input.bool(true, "Alert On First Touch",        group=gAlert)
-alertEntry = input.bool(true, "Alert On Confirmed Entry",    group=gAlert)
-alertNear  = input.bool(false,"Pre-Alert When Price Near",   group=gAlert)
-nearPct    = input.float(0.25,"Near Buffer (× zone height)", minval=0.0, step=0.05, group=gAlert)
+alertTouch = input.bool(true,  "Alert On First Touch", group=gAlert)
+alertEntry = input.bool(true,  "Alert On Confirmed Entry", group=gAlert)
+alertNear  = input.bool(false, "Pre-Alert When Price Near", group=gAlert)
+nearPct    = input.float(0.25, "Near Buffer (x zone height)", minval=0.0, step=0.05, group=gAlert)
 
 gStyle  = "Visual"
-demFill  = input.color(color.new(#26a69a, 80),"Demand Fill",       group=gStyle)
-supFill  = input.color(color.new(#ef5350, 80),"Supply Fill",       group=gStyle)
-sDemFill = input.color(color.new(#00ff88, 55),"SUPER Demand Fill", group=gStyle)
-sSupFill = input.color(color.new(#ff1744, 55),"SUPER Supply Fill", group=gStyle)
-demEdge  = input.color(#26a69a,"Demand Border",       group=gStyle)
-supEdge  = input.color(#ef5350,"Supply Border",       group=gStyle)
-sDemEdge = input.color(#00ff88,"SUPER Demand Border", group=gStyle)
-sSupEdge = input.color(#ff1744,"SUPER Supply Border", group=gStyle)
-demTxt   = input.string("BANK BUYING ZONE", "Demand Label", group=gStyle)
-supTxt   = input.string("BANK SELLING ZONE","Supply Label", group=gStyle)
-showTxt  = input.bool(true,"Show Labels", group=gStyle)
+demFill  = input.color(color.new(#26a69a, 80), "Demand Fill", group=gStyle)
+supFill  = input.color(color.new(#ef5350, 80), "Supply Fill", group=gStyle)
+sDemFill = input.color(color.new(#00ff88, 55), "SUPER Demand Fill", group=gStyle)
+sSupFill = input.color(color.new(#ff1744, 55), "SUPER Supply Fill", group=gStyle)
+demEdge  = input.color(#26a69a, "Demand Border", group=gStyle)
+supEdge  = input.color(#ef5350, "Supply Border", group=gStyle)
+sDemEdge = input.color(#00ff88, "SUPER Demand Border", group=gStyle)
+sSupEdge = input.color(#ff1744, "SUPER Supply Border", group=gStyle)
+demTxt   = input.string("BANK BUYING ZONE",  "Demand Label", group=gStyle)
+supTxt   = input.string("BANK SELLING ZONE", "Supply Label", group=gStyle)
+showTxt  = input.bool(true, "Show Labels", group=gStyle)
 
 // -----------------------------------------------------------------------------
-//  CORE BAR METRICS
+// CORE BAR METRICS
 // -----------------------------------------------------------------------------
-atr     = ta.atr(atrLen)
-volMa   = ta.sma(volume, volLen)
-rng     = high - low
-body    = math.abs(close - open)
-upWick  = high - math.max(close, open)
-dnWick  = math.min(close, open) - low
+atr    = ta.atr(atrLen)
+volMa  = ta.sma(volume, volLen)
+rng    = high - low
+body   = math.abs(close - open)
+upWick = high - math.max(close, open)
+dnWick = math.min(close, open) - low
 
 bullBar = close > open
 bearBar = close < open
@@ -110,14 +87,14 @@ bigBody = rng > 0 and body >= rng * bodyPct
 volSpk  = not useVol or volume >= volMa * volMult
 
 // -----------------------------------------------------------------------------
-//  MARKET STRUCTURE  (BOS / CHOCH)
+// MARKET STRUCTURE  (BOS / CHOCH)
 // -----------------------------------------------------------------------------
 ph = ta.pivothigh(high, pivLen, pivLen)
-pl = ta.pivotlow (low,  pivLen, pivLen)
+pl = ta.pivotlow(low,   pivLen, pivLen)
 
-var float lastPH    = na
-var float lastPL    = na
-var int   bias      = 0       // +1 bullish, -1 bearish
+var float lastPH = na
+var float lastPL = na
+var int   bias   = 0
 
 if not na(ph)
     lastPH := ph
@@ -137,27 +114,27 @@ bullStruct = bosUp or chUp
 bearStruct = bosDn or chDn
 
 // -----------------------------------------------------------------------------
-//  3-CANDLE FAIR VALUE GAP (evaluated on confirmed close)
+// 3-CANDLE FAIR VALUE GAP
 // -----------------------------------------------------------------------------
 bullFVG = low  > high[2]
 bearFVG = high < low[2]
 
 // -----------------------------------------------------------------------------
-//  LIQUIDITY SWEEP WICK
+// LIQUIDITY SWEEP WICK
 // -----------------------------------------------------------------------------
 demWick = not useWick or (rng > 0 and dnWick >= rng * wickPct)
 supWick = not useWick or (rng > 0 and upWick >= rng * wickPct)
 
 // -----------------------------------------------------------------------------
-//  CONFLUENCE
+// CONFLUENCE
 // -----------------------------------------------------------------------------
 vwapV = ta.vwap(hlc3)
 ema20 = ta.ema(close, 20)
 ema50 = ta.ema(close, 50)
 
-pdh = request.security(syminfo.tickerid,"D", high[1], lookahead=barmerge.lookahead_off)
-pdl = request.security(syminfo.tickerid,"D", low[1],  lookahead=barmerge.lookahead_off)
-pdc = request.security(syminfo.tickerid,"D", close[1],lookahead=barmerge.lookahead_off)
+pdh = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_off)
+pdc = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
 
 pivot  = (pdh + pdl + pdc) / 3.0
 bcLine = (pdh + pdl) / 2.0
@@ -165,8 +142,8 @@ tcLine = (pivot - bcLine) + pivot
 cprTop = math.max(tcLine, bcLine)
 cprBot = math.min(tcLine, bcLine)
 
-inCPR(_p)         => _p <= cprTop and _p >= cprBot
-nearLvl(_p, _l)   => math.abs(_p - _l) <= atr * 0.5
+inCPR(_p)       => _p <= cprTop and _p >= cprBot
+nearLvl(_p, _l) => math.abs(_p - _l) <= atr * 0.5
 
 vwapDem = not useVWAP or close >= vwapV
 vwapSup = not useVWAP or close <= vwapV
@@ -177,30 +154,30 @@ pdhlSup = not usePDHL or nearLvl(high, pdh)
 cprDem  = not useCPR  or inCPR(low)  or nearLvl(low,  cprBot)
 cprSup  = not useCPR  or inCPR(high) or nearLvl(high, cprTop)
 
-htfC = request.security(syminfo.tickerid, htfRes, close[1], lookahead=barmerge.lookahead_off)
-htfO = request.security(syminfo.tickerid, htfRes, open[1],  lookahead=barmerge.lookahead_off)
+htfC    = request.security(syminfo.tickerid, htfRes, close[1], lookahead=barmerge.lookahead_off)
+htfO    = request.security(syminfo.tickerid, htfRes, open[1],  lookahead=barmerge.lookahead_off)
 htfBull = htfC > htfO
 htfBear = htfC < htfO
 
 // -----------------------------------------------------------------------------
-//  ZONE QUALIFICATION
+// ZONE QUALIFICATION
 // -----------------------------------------------------------------------------
 fvgD = not useFVG or bullFVG
 fvgS = not useFVG or bearFVG
-bosD = not useBOS or bullStruct
-bosS = not useBOS or bearStruct
+bosOkD = not useBOS or bullStruct
+bosOkS = not useBOS or bearStruct
 
 baseDem = barstate.isconfirmed and inSess and displ and bigBody and volSpk and bullBar
 baseSup = barstate.isconfirmed and inSess and displ and bigBody and volSpk and bearBar
 
-isDemand = baseDem and demWick and fvgD and bosD and vwapDem and emaDem and pdhlDem and cprDem
-isSupply = baseSup and supWick and fvgS and bosS and vwapSup and emaSup and pdhlSup and cprSup
+isDemand = baseDem and demWick and fvgD and bosOkD and vwapDem and emaDem and pdhlDem and cprDem
+isSupply = baseSup and supWick and fvgS and bosOkS and vwapSup and emaSup and pdhlSup and cprSup
 
 isSuperDem = isDemand and bullStruct and bullFVG and volume >= volMa * volMult and (not useHTF or htfBull)
 isSuperSup = isSupply and bearStruct and bearFVG and volume >= volMa * volMult and (not useHTF or htfBear)
 
 // -----------------------------------------------------------------------------
-//  ZONE STORAGE
+// ZONE STORAGE
 // -----------------------------------------------------------------------------
 type Zone
     box   bx
@@ -221,19 +198,17 @@ f_make(bool _dem, bool _sup, float _top, float _bot) =>
     bcol = _dem ? (_sup ? sDemEdge : demEdge) : (_sup ? sSupEdge : supEdge)
     rx   = extendRight ? bar_index + 500 : bar_index + 30
     ext  = extendRight ? extend.right : extend.none
-    bx   = box.new(bar_index, _top, rx, _bot, border_color=bcol, border_width=2,
-                   bgcolor=fcol, extend=ext)
+    bx   = box.new(bar_index, _top, rx, _bot, border_color=bcol, border_width=2, bgcolor=fcol, extend=ext)
     mid  = (_top + _bot) / 2.0
     line ml = na
     if showMid
-        ml := line.new(bar_index, mid, rx, mid, color=color.new(bcol, 30),
-                       style=line.style_dotted, extend=ext)
+        ml := line.new(bar_index, mid, rx, mid, color=color.new(bcol, 30), style=line.style_dotted, extend=ext)
     label lb = na
     if showTxt
-        txt = (_dem ? demTxt : supTxt) + (_sup ? "  ★SUPER" : "")
-        lb := label.new(bar_index, _dem ? _bot : _top, txt,
-                        style=_dem ? label.style_label_up : label.style_label_down,
-                        color=color.new(bcol, 0), textcolor=color.white, size=size.small)
+        txt = (_dem ? demTxt : supTxt) + (_sup ? "  *SUPER" : "")
+        sty = _dem ? label.style_label_up : label.style_label_down
+        yy  = _dem ? _bot : _top
+        lb := label.new(bar_index, yy, txt, style=sty, color=color.new(bcol, 0), textcolor=color.white, size=size.small)
     Zone.new(bx, ml, lb, _top, _bot, bar_index, _sup, _dem, false, true)
 
 f_kill(Zone z) =>
@@ -265,9 +240,7 @@ f_add(bool _dem, bool _sup, float _top, float _bot) =>
     f_capSide(_dem)
 
 // -----------------------------------------------------------------------------
-//  CREATE NEW ZONES
-//  Demand zone : open .. low   of bull displacement candle
-//  Supply zone : high .. open  of bear displacement candle
+// CREATE NEW ZONES
 // -----------------------------------------------------------------------------
 if isDemand
     topZ = math.max(open, close)
@@ -280,7 +253,7 @@ if isSupply
     f_add(false, isSuperSup, topZ, botZ)
 
 // -----------------------------------------------------------------------------
-//  ZONE MANAGEMENT  -  expiry, invalidation, touch + entry trigger
+// ZONE MANAGEMENT
 // -----------------------------------------------------------------------------
 isNewDay = ta.change(time("D")) != 0
 
@@ -299,32 +272,30 @@ if array.size(zones) > 0
         if not z.alive
             continue
 
-        // Daily expiry
         if intraOnly and isNewDay and bar_index > z.created
             f_kill(z)
             array.set(zones, i, z)
             continue
 
-        // Hard invalidation on close beyond zone
         bad = false
-        if invalidOnClose
-            if z.isDem and close < z.bot
-                bad := true
-            if (not z.isDem) and close > z.top
-                bad := true
+        if invalidOnClose and z.isDem and close < z.bot
+            bad := true
+        if invalidOnClose and (not z.isDem) and close > z.top
+            bad := true
         if bad
             box.set_bgcolor(z.bx, color.new(color.gray, 90))
             box.set_border_color(z.bx, color.new(color.gray, 50))
             if not na(z.midL)
                 line.delete(z.midL)
-                z.midL := na
             z.alive := false
             array.set(zones, i, z)
             continue
 
-        // First touch detection
-        touchedNow = z.isDem ? (low <= z.top and high >= z.bot)
-                             : (high >= z.bot and low <= z.top)
+        touchedNow = false
+        if z.isDem and low <= z.top and high >= z.bot
+            touchedNow := true
+        if (not z.isDem) and high >= z.bot and low <= z.top
+            touchedNow := true
 
         if touchedNow and not z.touched
             z.touched := true
@@ -333,39 +304,27 @@ if array.size(zones) > 0
             else
                 fireSupTouch := true
 
-            // Confirmed rejection candle entry trigger
-            rejBull = z.isDem      and close > open and dnWick >= rng * wickPct
+            rejBull = z.isDem       and close > open and dnWick >= rng * wickPct
             rejBear = (not z.isDem) and close < open and upWick >= rng * wickPct
 
             if showEntry and rejBull
-                label.new(bar_index, low, "BUY",
-                     style=label.style_label_up,
-                     color=color.new(sDemEdge, 0),
-                     textcolor=color.white, size=size.small)
+                label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.new(sDemEdge, 0), textcolor=color.white, size=size.small)
                 if showSLTP
                     sl = z.bot
                     tp = close + (close - sl) * rrTarget
-                    line.new(bar_index, sl, bar_index + 25, sl,
-                         color=color.new(color.red, 0), style=line.style_dashed)
-                    line.new(bar_index, tp, bar_index + 25, tp,
-                         color=color.new(color.green, 0), style=line.style_dashed)
+                    line.new(bar_index, sl, bar_index + 25, sl, color=color.new(color.red, 0),   style=line.style_dashed)
+                    line.new(bar_index, tp, bar_index + 25, tp, color=color.new(color.green, 0), style=line.style_dashed)
                 fireDemEntry := true
 
             if showEntry and rejBear
-                label.new(bar_index, high, "SELL",
-                     style=label.style_label_down,
-                     color=color.new(sSupEdge, 0),
-                     textcolor=color.white, size=size.small)
+                label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.new(sSupEdge, 0), textcolor=color.white, size=size.small)
                 if showSLTP
                     sl = z.top
                     tp = close - (sl - close) * rrTarget
-                    line.new(bar_index, sl, bar_index + 25, sl,
-                         color=color.new(color.red, 0), style=line.style_dashed)
-                    line.new(bar_index, tp, bar_index + 25, tp,
-                         color=color.new(color.green, 0), style=line.style_dashed)
+                    line.new(bar_index, sl, bar_index + 25, sl, color=color.new(color.red, 0),   style=line.style_dashed)
+                    line.new(bar_index, tp, bar_index + 25, tp, color=color.new(color.green, 0), style=line.style_dashed)
                 fireSupEntry := true
 
-        // Pre-alert when price approaching
         if alertNear and not z.touched
             buf = (z.top - z.bot) * nearPct
             if z.isDem and low <= z.top + buf and low > z.top
@@ -373,23 +332,22 @@ if array.size(zones) > 0
             if (not z.isDem) and high >= z.bot - buf and high < z.bot
                 alert("Price approaching Institutional Supply Zone", alert.freq_once_per_bar)
 
-        // Fade tested zones
         if freshOnly and z.touched and z.alive
             box.set_bgcolor(z.bx, color.new(color.gray, 92))
 
         array.set(zones, i, z)
 
 // -----------------------------------------------------------------------------
-//  ALERTS
+// ALERTS
 // -----------------------------------------------------------------------------
 if alertTouch and fireDemTouch
     alert("Demand zone TOUCHED  -  watch for bullish reaction", alert.freq_once_per_bar)
 if alertTouch and fireSupTouch
     alert("Supply zone TOUCHED  -  watch for bearish reaction", alert.freq_once_per_bar)
 if alertEntry and fireDemEntry
-    alert("BUY signal  -  rejection inside Demand zone",        alert.freq_once_per_bar)
+    alert("BUY signal  -  rejection inside Demand zone",  alert.freq_once_per_bar)
 if alertEntry and fireSupEntry
-    alert("SELL signal  -  rejection inside Supply zone",       alert.freq_once_per_bar)
+    alert("SELL signal  -  rejection inside Supply zone", alert.freq_once_per_bar)
 
 alertcondition(fireDemTouch, "Demand Touch", "Demand zone touched - bullish setup")
 alertcondition(fireSupTouch, "Supply Touch", "Supply zone touched - bearish setup")
@@ -397,17 +355,13 @@ alertcondition(fireDemEntry, "BUY Entry",    "BUY rejection in demand zone")
 alertcondition(fireSupEntry, "SELL Entry",   "SELL rejection in supply zone")
 
 // -----------------------------------------------------------------------------
-//  CONFLUENCE OVERLAYS (optional, plotted only when enabled)
+// CONFLUENCE OVERLAYS
 // -----------------------------------------------------------------------------
-plot(useVWAP ? vwapV  : na, "VWAP",      color=color.new(color.orange,   0))
-plot(useEMA  ? ema20  : na, "EMA 20",    color=color.new(color.yellow,   0))
-plot(useEMA  ? ema50  : na, "EMA 50",    color=color.new(color.aqua,     0))
-plot(usePDHL ? pdh    : na, "PDH",       color=color.new(color.gray,    20), style=plot.style_linebr)
-plot(usePDHL ? pdl    : na, "PDL",       color=color.new(color.gray,    20), style=plot.style_linebr)
-plot(useCPR  ? pivot  : na, "CPR Pivot", color=color.new(color.fuchsia, 30))
-plot(useCPR  ? cprTop : na, "CPR TC",    color=color.new(color.fuchsia, 50))
-plot(useCPR  ? cprBot : na, "CPR BC",    color=color.new(color.fuchsia, 50))
-
-// =============================================================================
-//  END
-// =============================================================================
+plot(useVWAP ? vwapV  : na, "VWAP",      color=color.new(color.orange,  0))
+plot(useEMA  ? ema20  : na, "EMA 20",    color=color.new(color.yellow,  0))
+plot(useEMA  ? ema50  : na, "EMA 50",    color=color.new(color.aqua,    0))
+plot(usePDHL ? pdh    : na, "PDH",       color=color.new(color.gray,   20), style=plot.style_linebr)
+plot(usePDHL ? pdl    : na, "PDL",       color=color.new(color.gray,   20), style=plot.style_linebr)
+plot(useCPR  ? pivot  : na, "CPR Pivot", color=color.new(color.fuchsia,30))
+plot(useCPR  ? cprTop : na, "CPR TC",    color=color.new(color.fuchsia,50))
+plot(useCPR  ? cprBot : na, "CPR BC",    color=color.new(color.fuchsia,50))
