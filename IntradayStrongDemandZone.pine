@@ -159,13 +159,15 @@ type Zone
 
 var array<Zone> zones = array.new<Zone>()
 
+// Drawings use xloc=xloc.bar_index so coords lock to the underlying bar
+// (not pixels / time). Right edge starts at the current bar; extend.right
+// makes it grow infinitely without redrawing.
 f_drawZone(float _top, float _bot, int _bar) =>
-    rightX = extendRight ? bar_index + 500 : bar_index + 30
     extOpt = extendRight ? extend.right : extend.none
-    bx = box.new(left=_bar, top=_top, right=rightX, bottom=_bot, border_color=zoneBord, border_width=2, bgcolor=zoneFill, extend=extOpt)
+    bx = box.new(left=_bar, top=_top, right=bar_index, bottom=_bot, xloc=xloc.bar_index, border_color=zoneBord, border_width=2, bgcolor=zoneFill, extend=extOpt)
     mid = (_top + _bot) / 2.0
-    ml = showMid ? line.new(_bar, mid, rightX, mid, color=color.new(zoneBord, 30), style=line.style_dotted, width=1, extend=extOpt) : na
-    lb = label.new(_bar, _bot, zoneText, style=label.style_label_up, color=color.new(zoneBord, 0), textcolor=color.white, size=size.small)
+    ml = showMid ? line.new(_bar, mid, bar_index, mid, xloc=xloc.bar_index, color=color.new(zoneBord, 30), style=line.style_dotted, width=1, extend=extOpt) : na
+    lb = label.new(_bar, _bot, zoneText, xloc=xloc.bar_index, style=label.style_label_up, color=color.new(zoneBord, 0), textcolor=color.white, size=size.small)
     Zone.new(bx, ml, lb, _top, _bot, _bar, false, true)
 
 // -----------------------------------------------------------------------------
@@ -199,6 +201,11 @@ if array.size(zones) > 0
         z = array.get(zones, i)
         if not z.alive
             continue
+        // Anchor refresh: keep the right edge tracking the latest bar so
+        // zones stay locked to candles and never drift when scrolling.
+        box.set_right(z.bx, bar_index)
+        if not na(z.midL)
+            line.set_x2(z.midL, bar_index)
         if intradayOnly and isNewDay and bar_index > z.created
             z.alive := false
             box.delete(z.bx)

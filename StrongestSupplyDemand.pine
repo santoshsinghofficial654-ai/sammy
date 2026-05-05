@@ -166,16 +166,18 @@ type Zone
 
 var array<Zone> zones = array.new<Zone>()
 
+// Drawings are anchored with xloc=xloc.bar_index so coords reference the
+// underlying bar (not pixels / time). Right edge starts at the current
+// bar; extend=extend.right makes it grow infinitely without redrawing.
 f_drawZone(bool _isDem, float _top, float _bot, int _bar, int _score) =>
-    rightX = extendRight ? bar_index + 500 : bar_index + 30
     extOpt = extendRight ? extend.right : extend.none
     fill = _isDem ? demFill : supFill
     bord = _isDem ? demBord : supBord
-    bx = box.new(left=_bar, top=_top, right=rightX, bottom=_bot, border_color=bord, border_width=2, bgcolor=fill, extend=extOpt)
+    bx = box.new(left=_bar, top=_top, right=bar_index, bottom=_bot, xloc=xloc.bar_index, border_color=bord, border_width=2, bgcolor=fill, extend=extOpt)
     mid = (_top + _bot) / 2.0
-    ml = showMid ? line.new(_bar, mid, rightX, mid, color=color.new(bord, 30), style=line.style_dotted, width=1, extend=extOpt) : na
-    lb = showLabels ? label.new(_bar, _isDem ? _bot : _top, _isDem ? demTxt : supTxt, style=_isDem ? label.style_label_up : label.style_label_down, color=color.new(bord, 0), textcolor=color.white, size=size.small) : na
-    scLbl = showScore ? label.new(_bar, _isDem ? _top : _bot, "Score " + str.tostring(_score) + "/10", style=label.style_label_left, color=color.new(bord, 20), textcolor=color.white, size=size.tiny) : na
+    ml = showMid ? line.new(_bar, mid, bar_index, mid, xloc=xloc.bar_index, color=color.new(bord, 30), style=line.style_dotted, width=1, extend=extOpt) : na
+    lb = showLabels ? label.new(_bar, _isDem ? _bot : _top, _isDem ? demTxt : supTxt, xloc=xloc.bar_index, style=_isDem ? label.style_label_up : label.style_label_down, color=color.new(bord, 0), textcolor=color.white, size=size.small) : na
+    scLbl = showScore ? label.new(_bar, _isDem ? _top : _bot, "Score " + str.tostring(_score) + "/10", xloc=xloc.bar_index, style=label.style_label_left, color=color.new(bord, 20), textcolor=color.white, size=size.tiny) : na
     Zone.new(bx, ml, lb, scLbl, _top, _bot, _bar, _score, _isDem, false, false, na, true)
 
 f_capZones(bool _isDem) =>
@@ -233,6 +235,11 @@ if array.size(zones) > 0
         z = array.get(zones, i)
         if not z.alive
             continue
+        // Anchor refresh: keep the right edge tracking the latest bar so
+        // zones stay locked to candles and never drift when scrolling.
+        box.set_right(z.bx, bar_index)
+        if not na(z.midL)
+            line.set_x2(z.midL, bar_index)
         // Intraday expiry
         if intradayOnly and isNewDay and bar_index > z.created
             z.alive := false
