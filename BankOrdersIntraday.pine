@@ -1,11 +1,12 @@
 //@version=5
 // =============================================================================
-//  BANK ORDERS – Intraday Precision Indicator
-//  Bank Selling Orders (supply) + Bank Buying Orders (demand) + Turning Points
-//  Non-repainting. Confirmed-bar logic. Tuned for 5m / 15m intraday.
+//  HEAVY INSTITUTIONAL ZONES – Intraday (Strongest Only)
+//  Bank Buying / Bank Selling Order Blocks + Market Turning Points
+//  Confluence-scored, non-repainting, confirmed-bar logic.
+//  Best on 5m / 15m intraday.
 // =============================================================================
-indicator("BANK ORDERS – Intraday Precision",
-     shorttitle="BANK ORDERS",
+indicator("HEAVY INSTITUTIONAL ZONES – Intraday",
+     shorttitle="HEAVY INST ZONES",
      overlay=true,
      max_boxes_count=500,
      max_lines_count=500,
@@ -14,53 +15,56 @@ indicator("BANK ORDERS – Intraday Precision",
 // -----------------------------------------------------------------------------
 //  INPUTS
 // -----------------------------------------------------------------------------
-gDet  = "Detection Engine"
-atrLen   = input.int(14,   "ATR Length",                    minval=2,    group=gDet)
-displAtr = input.float(1.7,"Displacement: Range ≥ ATR ×",   minval=0.5,  step=0.1, group=gDet)
-bodyR    = input.float(0.62,"Min Body / Range Ratio",       minval=0.30, maxval=1.0, step=0.02, group=gDet)
-volLen   = input.int(20,   "Volume MA Length",              minval=2,    group=gDet)
-volX     = input.float(1.6,"Volume Spike × MA",             minval=1.0,  step=0.1, group=gDet)
-swingLen = input.int(5,    "Swing / Pivot Length",          minval=2,    maxval=20, group=gDet)
+gDet = "Detection Engine"
+atrLen   = input.int(14,    "ATR Length",                  minval=2,    group=gDet)
+displAtr = input.float(2.0, "Displacement: Range ≥ ATR ×", minval=0.8,  step=0.1, group=gDet)
+bodyR    = input.float(0.70,"Min Body / Range Ratio",      minval=0.30, maxval=1.0, step=0.02, group=gDet)
+volLen   = input.int(20,    "Volume MA Length",            minval=2,    group=gDet)
+volX     = input.float(1.8, "Volume Spike × MA",           minval=1.0,  step=0.1, group=gDet)
+swingLen = input.int(5,     "Swing / Pivot Length",        minval=2,    maxval=20, group=gDet)
+wickR    = input.float(0.35,"Min Sweep Wick / Range",      minval=0.10, step=0.05, group=gDet)
+htfTF    = input.timeframe("60", "HTF Resolution",         group=gDet)
 
-gFilt = "Accuracy Filters (all ON = strictest)"
-fVol   = input.bool(true, "Require Volume Spike",                   group=gFilt)
-fFVG   = input.bool(true, "Require Fair Value Gap (3-bar)",         group=gFilt)
-fBOS   = input.bool(true, "Require BOS / CHOCH structure break",    group=gFilt)
-fSweep = input.bool(true, "Require Liquidity Sweep wick",           group=gFilt)
-wickR  = input.float(0.35,"Min Sweep Wick / Range",   minval=0.10, step=0.05, group=gFilt)
-fHTF   = input.bool(true, "Require HTF trend agreement",            group=gFilt)
-htfTF  = input.timeframe("60", "HTF Resolution",                    group=gFilt)
-fSess  = input.bool(false,"Restrict to Session",                    group=gFilt)
-sessTF = input.session("0915-1500","Session (exchange time)",       group=gFilt)
+gStr = "Strength Filter (HEAVY = strongest zones only)"
+minScore   = input.int(5,   "Minimum Strength Score (out of 6)", minval=1, maxval=6, group=gStr,
+     tooltip="A zone must satisfy at least this many confluences to be plotted. 6 = institutional-grade only.")
+heavyScore = input.int(6,   "Institutional ★ Threshold",         minval=2, maxval=6, group=gStr,
+     tooltip="Zones at or above this score are highlighted as ★ INSTITUTIONAL.")
+sessFilter = input.bool(false,"Restrict to Session",              group=gStr)
+sessTF     = input.session("0915-1500","Session (exchange time)", group=gStr)
 
 gZone = "Zone Behaviour"
-intradayOnly = input.bool(true,  "Intraday Only (auto-expire next day)", group=gZone)
-extendRight  = input.bool(true,  "Extend Zones Right",                   group=gZone)
-freshOnly    = input.bool(true,  "Fade After First Touch",               group=gZone)
-killOnClose  = input.bool(true,  "Invalidate when Close beyond zone",    group=gZone)
-mergeOverlap = input.bool(true,  "Merge Overlapping Same-side Zones",    group=gZone)
-maxPerSide   = input.int(6,      "Max Active Zones per Side", minval=1, maxval=15, group=gZone)
-zoneLabel    = input.bool(true,  "Show Zone Labels",                     group=gZone)
+intradayOnly = input.bool(true, "Intraday Only (auto-expire next day)", group=gZone)
+extendRight  = input.bool(true, "Extend Zones to Live Edge",            group=gZone)
+freshOnly    = input.bool(true, "Fade After First Touch",               group=gZone)
+killOnClose  = input.bool(true, "Invalidate when Close beyond zone",    group=gZone)
+mergeOverlap = input.bool(true, "Merge Overlapping Same-side Zones",    group=gZone)
+maxPerSide   = input.int(5,     "Max Active Zones per Side",  minval=1, maxval=15, group=gZone)
+zoneLabel    = input.bool(true, "Show Zone Labels",                     group=gZone)
 
 gTP = "Market Turning Points"
-showTP       = input.bool(true,  "Show Turning Points",                group=gTP)
-tpRequireBOS = input.bool(false, "Only mark TP that produced BOS",     group=gTP)
+showTP       = input.bool(true,  "Show Turning Points",                 group=gTP)
+tpRequireBOS = input.bool(false, "Only mark TP that produced BOS",      group=gTP)
 
 gAlert = "Alerts"
-aTouch = input.bool(true, "Alert on Zone Touch",                     group=gAlert)
-aBreak = input.bool(true, "Alert on Zone Invalidation",              group=gAlert)
-aReject= input.bool(true, "Alert on Rejection from Zone",            group=gAlert)
+aTouch = input.bool(true, "Alert on Zone Touch",                        group=gAlert)
+aBreak = input.bool(true, "Alert on Zone Invalidation",                 group=gAlert)
+aReject= input.bool(true, "Alert on Rejection from Zone",               group=gAlert)
+aHeavy = input.bool(true, "Alert on NEW Institutional Zone",            group=gAlert)
 
 gStyle = "Visual Design"
-buyFill   = input.color(color.new(#a020f0, 78), "Buy Zone Fill (Purple)",  group=gStyle)
-sellFill  = input.color(color.new(#ff1f6d, 78), "Sell Zone Fill (Pink/Red)", group=gStyle)
-buyBord   = input.color(#a020f0,                "Buy Zone Border",          group=gStyle)
-sellBord  = input.color(#ff1f6d,                "Sell Zone Border",         group=gStyle)
-fadedFill = input.color(color.new(color.gray, 90), "Faded (touched) Fill",  group=gStyle)
-buyTxt    = input.string("BANK BUYING ORDER",  "Buy Zone Label",  group=gStyle)
-sellTxt   = input.string("BANK SELLING ORDER", "Sell Zone Label", group=gStyle)
-tpHighCol = input.color(#ff3333, "Swing-High Dot",  group=gStyle)
-tpLowCol  = input.color(#22ff66, "Swing-Low  Dot",  group=gStyle)
+buyFill    = input.color(color.new(#a020f0, 80), "Buy Zone Fill",        group=gStyle)
+buyHeavy   = input.color(color.new(#a020f0, 60), "Buy Zone Fill ★",      group=gStyle)
+sellFill   = input.color(color.new(#ff1f6d, 80), "Sell Zone Fill",       group=gStyle)
+sellHeavy  = input.color(color.new(#ff1f6d, 60), "Sell Zone Fill ★",     group=gStyle)
+buyBord    = input.color(#a020f0, "Buy Border",                          group=gStyle)
+sellBord   = input.color(#ff1f6d, "Sell Border",                         group=gStyle)
+fadedFill  = input.color(color.new(color.gray, 90), "Faded Fill",        group=gStyle)
+buyTxt     = input.string("BANK BUYING ORDER",  "Buy Label",             group=gStyle)
+sellTxt    = input.string("BANK SELLING ORDER", "Sell Label",            group=gStyle)
+heavyTag   = input.string("★ INSTITUTIONAL",   "Heavy-Zone Suffix",      group=gStyle)
+tpHighCol  = input.color(#ff3333, "Swing-High Dot",                      group=gStyle)
+tpLowCol   = input.color(#22ff66, "Swing-Low  Dot",                      group=gStyle)
 
 // -----------------------------------------------------------------------------
 //  CORE METRICS
@@ -74,22 +78,21 @@ dnWick = math.min(close, open) - low
 
 bigRange = rng > atrV * displAtr
 bigBody  = bodySz >= rng * bodyR
-volOk    = not fVol or volume >= volMa * volX
+volSpike = volume >= volMa * volX
 bull     = close > open
 bear     = close < open
 
-// Session gate
-inSess = not fSess or not na(time(timeframe.period, sessTF))
+inSess = not sessFilter or not na(time(timeframe.period, sessTF))
 
 // -----------------------------------------------------------------------------
-//  MARKET STRUCTURE  (BOS / CHOCH)
+//  STRUCTURE: BOS / CHOCH
 // -----------------------------------------------------------------------------
 ph = ta.pivothigh(high, swingLen, swingLen)
 pl = ta.pivotlow (low,  swingLen, swingLen)
 
 var float lastPH = na
 var float lastPL = na
-var int   bias   = 0   // +1 bull, -1 bear
+var int   bias   = 0
 
 if not na(ph)
     lastPH := ph
@@ -104,12 +107,11 @@ if bosUp
     bias := 1
 if bosDn
     bias := -1
-
 bullStruct = bosUp or chUp
 bearStruct = bosDn or chDn
 
 // -----------------------------------------------------------------------------
-//  FAIR VALUE GAP (confirmed close, 3-bar)
+//  FAIR VALUE GAP (3-bar imbalance)
 // -----------------------------------------------------------------------------
 bullFVG = low  > high[2]
 bearFVG = high < low[2]
@@ -123,25 +125,35 @@ htfBull  = htfClose > htfOpen
 htfBear  = htfClose < htfOpen
 
 // -----------------------------------------------------------------------------
-//  BANK ORDER QUALIFICATION
-//  All checks evaluated on confirmed bars only -> no repaint.
+//  CONFLUENCE SCORING (0-6)
 // -----------------------------------------------------------------------------
-fvgB  = not fFVG   or bullFVG
-fvgS  = not fFVG   or bearFVG
-bosB  = not fBOS   or bullStruct
-bosS  = not fBOS   or bearStruct
-swB   = not fSweep or dnWick >= rng * wickR
-swS   = not fSweep or upWick >= rng * wickR
-htfB  = not fHTF   or htfBull
-htfS  = not fHTF   or htfBear
+sweepBuy  = dnWick >= rng * wickR
+sweepSell = upWick >= rng * wickR
 
-base = barstate.isconfirmed and bigRange and bigBody and volOk and inSess
+buyScore =
+   (bigRange   ? 1 : 0) +
+   (bigBody    ? 1 : 0) +
+   (volSpike   ? 1 : 0) +
+   (bullFVG    ? 1 : 0) +
+   (bullStruct ? 1 : 0) +
+   ((htfBull and sweepBuy) ? 1 : 0)
 
-isBuy  = base and bull and swB and fvgB and bosB and htfB
-isSell = base and bear and swS and fvgS and bosS and htfS
+sellScore =
+   (bigRange   ? 1 : 0) +
+   (bigBody    ? 1 : 0) +
+   (volSpike   ? 1 : 0) +
+   (bearFVG    ? 1 : 0) +
+   (bearStruct ? 1 : 0) +
+   ((htfBear and sweepSell) ? 1 : 0)
+
+base   = barstate.isconfirmed and inSess
+isBuy  = base and bull and buyScore  >= minScore
+isSell = base and bear and sellScore >= minScore
+buyHeavyZone  = isBuy  and buyScore  >= heavyScore
+sellHeavyZone = isSell and sellScore >= heavyScore
 
 // -----------------------------------------------------------------------------
-//  ZONE STORAGE
+//  ZONE STORAGE (UDT)
 // -----------------------------------------------------------------------------
 type Zone
     box   bx
@@ -149,7 +161,9 @@ type Zone
     float top
     float bot
     int   created
+    int   score
     bool  isBuy
+    bool  isHeavy
     bool  touched
     bool  alive
 
@@ -161,19 +175,22 @@ f_clear(Zone z) =>
         label.delete(z.lbl)
     true
 
-f_draw(bool _buy, float _t, float _b) =>
-    color  fill   = _buy ? buyFill : sellFill
+f_draw(bool _buy, bool _heavy, int _score, float _t, float _b) =>
+    color  fill   = _buy ? (_heavy ? buyHeavy  : buyFill ) : (_heavy ? sellHeavy : sellFill)
     color  border = _buy ? buyBord : sellBord
+    int    bw     = _heavy ? 3 : 2
     int    rightX = bar_index + 30
     box    bx     = box.new(left=bar_index, top=_t, right=rightX, bottom=_b,
-                     border_color=border, border_width=2, bgcolor=fill,
+                     border_color=border, border_width=bw, bgcolor=fill,
                      extend=extendRight ? extend.right : extend.none)
     label  lb     = na
     if zoneLabel
-        string txt = _buy ? buyTxt : sellTxt
-        lb := label.new(bar_index + 5, (_t + _b) / 2.0, txt,
+        string baseTxt = _buy ? buyTxt : sellTxt
+        string tag     = _heavy ? "  " + heavyTag : ""
+        string scr     = "  (" + str.tostring(_score) + "/6)"
+        lb := label.new(bar_index + 5, (_t + _b) / 2.0, baseTxt + tag + scr,
              style=label.style_none, textcolor=color.white, size=size.small)
-    Zone.new(bx, lb, _t, _b, bar_index, _buy, false, true)
+    Zone.new(bx, lb, _t, _b, bar_index, _score, _buy, _heavy, false, true)
 
 f_capSide(bool _buy) =>
     int cnt = 0
@@ -183,16 +200,22 @@ f_capSide(bool _buy) =>
             if zi.alive and zi.isBuy == _buy
                 cnt += 1
     if cnt > maxPerSide and array.size(zones) > 0
+        int idxWeakest = -1
+        int minSc      = 99
         for i = 0 to array.size(zones) - 1
             zj = array.get(zones, i)
             if zj.alive and zj.isBuy == _buy
-                zj.alive := false
-                f_clear(zj)
-                array.set(zones, i, zj)
-                break
+                if zj.score < minSc
+                    minSc := zj.score
+                    idxWeakest := i
+        if idxWeakest >= 0
+            zk = array.get(zones, idxWeakest)
+            zk.alive := false
+            f_clear(zk)
+            array.set(zones, idxWeakest, zk)
     true
 
-f_addZone(bool _buy, float _t, float _b) =>
+f_addZone(bool _buy, bool _heavy, int _score, float _t, float _b) =>
     bool merged = false
     if mergeOverlap and array.size(zones) > 0
         for i = 0 to array.size(zones) - 1
@@ -204,13 +227,18 @@ f_addZone(bool _buy, float _t, float _b) =>
                     float nb = math.min(zi.bot, _b)
                     box.set_top(zi.bx, nt)
                     box.set_bottom(zi.bx, nb)
-                    zi.top := nt
-                    zi.bot := nb
+                    zi.top   := nt
+                    zi.bot   := nb
+                    zi.score := math.max(zi.score, _score)
+                    if _heavy and not zi.isHeavy
+                        zi.isHeavy := true
+                        box.set_border_width(zi.bx, 3)
+                        box.set_bgcolor(zi.bx, _buy ? buyHeavy : sellHeavy)
                     array.set(zones, i, zi)
                     merged := true
                     break
     if not merged
-        Zone z = f_draw(_buy, _t, _b)
+        Zone z = f_draw(_buy, _heavy, _score, _t, _b)
         array.push(zones, z)
         f_capSide(_buy)
     true
@@ -218,15 +246,22 @@ f_addZone(bool _buy, float _t, float _b) =>
 // -----------------------------------------------------------------------------
 //  CREATE BANK ORDERS
 // -----------------------------------------------------------------------------
+var bool newHeavyAlert = false
+newHeavyAlert := false
+
 if isBuy
     topZ = math.max(open, close)
-    botZ = low                        // include sweep wick
-    f_addZone(true, topZ, botZ)
+    botZ = low
+    f_addZone(true, buyHeavyZone, buyScore, topZ, botZ)
+    if buyHeavyZone
+        newHeavyAlert := true
 
 if isSell
-    topZ = high                       // include sweep wick
+    topZ = high
     botZ = math.min(open, close)
-    f_addZone(false, topZ, botZ)
+    f_addZone(false, sellHeavyZone, sellScore, topZ, botZ)
+    if sellHeavyZone
+        newHeavyAlert := true
 
 // -----------------------------------------------------------------------------
 //  ZONE LIFECYCLE
@@ -246,14 +281,12 @@ if array.size(zones) > 0
         if not z.alive
             continue
 
-        // Auto-expire next day
         if intradayOnly and isNewDay and bar_index > z.created
             z.alive := false
             f_clear(z)
             array.set(zones, i, z)
             continue
 
-        // Invalidation by close beyond zone
         invalid = false
         if killOnClose
             if z.isBuy and close < z.bot
@@ -286,7 +319,7 @@ if array.size(zones) > 0
             box.set_bgcolor(z.bx, fadedFill)
 
 // -----------------------------------------------------------------------------
-//  MARKET TURNING POINTS  (red/green dots like the screenshot)
+//  MARKET TURNING POINTS
 // -----------------------------------------------------------------------------
 bool phPlot = not na(ph) and (not tpRequireBOS or bosDn)
 bool plPlot = not na(pl) and (not tpRequireBOS or bosUp)
@@ -302,15 +335,18 @@ plotshape(showTP and plPlot, title="Swing Low",
 //  ALERTS
 // -----------------------------------------------------------------------------
 if aTouch and touchAlert
-    alert("BANK ORDER touched – watch for reaction", alert.freq_once_per_bar)
+    alert("INSTITUTIONAL ZONE touched – watch for reaction", alert.freq_once_per_bar)
 if aReject and rejectAlert
-    alert("BANK ORDER rejection – high-probability entry", alert.freq_once_per_bar)
+    alert("INSTITUTIONAL ZONE rejection – high-probability entry", alert.freq_once_per_bar)
 if aBreak and breakAlert
-    alert("BANK ORDER invalidated – zone broken", alert.freq_once_per_bar)
+    alert("INSTITUTIONAL ZONE invalidated – zone broken", alert.freq_once_per_bar)
+if aHeavy and newHeavyAlert
+    alert("NEW ★ INSTITUTIONAL zone formed", alert.freq_once_per_bar)
 
-alertcondition(touchAlert,  title="Zone Touch",        message="BANK ORDER touched")
-alertcondition(rejectAlert, title="Zone Rejection",    message="BANK ORDER rejection – entry signal")
-alertcondition(breakAlert,  title="Zone Invalidation", message="BANK ORDER invalidated")
+alertcondition(touchAlert,    title="Zone Touch",          message="INSTITUTIONAL ZONE touched")
+alertcondition(rejectAlert,   title="Zone Rejection",      message="INSTITUTIONAL ZONE rejection")
+alertcondition(breakAlert,    title="Zone Invalidation",   message="INSTITUTIONAL ZONE invalidated")
+alertcondition(newHeavyAlert, title="New ★ Institutional", message="NEW ★ INSTITUTIONAL zone")
 
 // =============================================================================
 //  END
