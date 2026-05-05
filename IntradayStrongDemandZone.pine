@@ -1,90 +1,68 @@
 //@version=5
 // =============================================================================
-//  Intraday Strong Demand Zone — Early Institutional Catcher
-//  Pine Script v5 | Non-repainting | Designed for NSE 5m / 15m intraday
-//
-//  PURPOSE
-//  -------
-//  Catch the FIRST big institutional buying footprint of the session and
-//  lock in a "Trending-Up Day" bias as soon as heavy buyers commit.
-//
-//  LOGIC FLOW (all conditions must align on a confirmed bar)
-//   1. EARLY-SESSION WINDOW          → only first hours when smart money loads
-//   2. PRE-MOVE COMPRESSION          → quiet accumulation (low avg range)
-//   3. LIQUIDITY SWEEP               → stop-hunt below swing/OR/PD low
-//   4. INSTITUTIONAL DISPLACEMENT    → big bullish candle (range, body, vol)
-//   5. ABOVE-VWAP CLOSE + BULL FVG   → no pull-back, imbalance left behind
-//   6. NO-PULLBACK FOLLOW-THROUGH    → next N bars do NOT retrace > X%
-//                                      (this is the "heavy-buyer" proof)
-//   → ZONE FORMS  +  DAY BIAS = LONG (locked until invalidated)
+//  Intraday Strong Demand Zone - Early Institutional Catcher
+//  Pine Script v5 | Non-repainting | NSE 5m / 15m intraday
 // =============================================================================
-indicator("Intraday Strong Demand Zone — Early Institutional Catcher",
-     shorttitle="STRONG DEMAND",
-     overlay=true,
-     max_boxes_count=200,
-     max_lines_count=200,
-     max_labels_count=200)
+indicator("Intraday Strong Demand Zone - Early Institutional Catcher", shorttitle="STRONG DEMAND", overlay=true, max_boxes_count=200, max_lines_count=200, max_labels_count=200)
 
 // -----------------------------------------------------------------------------
 //  INPUTS
 // -----------------------------------------------------------------------------
 grpSess = "Session / Time"
-useSession   = input.bool(true,  "Detect Only In Session Window", group=grpSess)
+useSession   = input.bool(true, "Detect Only In Session Window", group=grpSess)
 sessTime     = input.session("0915-1200", "Session Window (Early Move)", group=grpSess)
-sessTZ       = input.string("Asia/Kolkata", "Session Timezone", group=grpSess,
-                  options=["Asia/Kolkata","America/New_York","Europe/London","exchange"])
-intradayOnly = input.bool(true,  "Auto-Expire Zone Next Day", group=grpSess)
+sessTZ       = input.string("Asia/Kolkata", "Session Timezone", options=["Asia/Kolkata","America/New_York","Europe/London","exchange"], group=grpSess)
+intradayOnly = input.bool(true, "Auto-Expire Zone Next Day", group=grpSess)
 
 grpAccum = "Pre-Move Accumulation"
-useAccum   = input.bool(true,  "Require Compression Before Move", group=grpAccum)
-accumLen   = input.int(8,      "Compression Lookback (bars)",     minval=3, group=grpAccum)
-accumRatio = input.float(0.7,  "Max Avg-Range / ATR",             minval=0.2, step=0.05, group=grpAccum)
+useAccum   = input.bool(true, "Require Compression Before Move", group=grpAccum)
+accumLen   = input.int(8, "Compression Lookback (bars)", minval=3, group=grpAccum)
+accumRatio = input.float(0.7, "Max Avg-Range / ATR", minval=0.2, step=0.05, group=grpAccum)
 
 grpSweep = "Liquidity Sweep (Stop-Hunt)"
-useSwing     = input.bool(true,  "Sweep of Prior Swing Low",        group=grpSweep)
-sweepLen     = input.int(10,     "Swing Low Lookback",               minval=3, group=grpSweep)
-useORL       = input.bool(true,  "Sweep of Opening Range Low",      group=grpSweep)
-orMins       = input.int(15,     "Opening Range (minutes)",          minval=5, group=grpSweep)
-usePDL       = input.bool(false, "Sweep of Previous Day Low",       group=grpSweep)
-requireSweep = input.bool(true,  "Require At Least One Sweep",      group=grpSweep)
+useSwing     = input.bool(true, "Sweep of Prior Swing Low", group=grpSweep)
+sweepLen     = input.int(10, "Swing Low Lookback", minval=3, group=grpSweep)
+useORL       = input.bool(true, "Sweep of Opening Range Low", group=grpSweep)
+orMins       = input.int(15, "Opening Range (minutes)", minval=5, group=grpSweep)
+usePDL       = input.bool(false, "Sweep of Previous Day Low", group=grpSweep)
+requireSweep = input.bool(true, "Require At Least One Sweep", group=grpSweep)
 
 grpDisp = "Institutional Displacement Candle"
-atrLen    = input.int(14,    "ATR Length",            minval=2, group=grpDisp)
-atrMult   = input.float(1.8, "Min Range / ATR",       minval=0.5, step=0.1, group=grpDisp)
-bodyPct   = input.float(0.65,"Min Body / Range",      minval=0.3, maxval=1.0, step=0.05, group=grpDisp)
-volLen    = input.int(20,    "Volume MA Length",      minval=2, group=grpDisp)
-volMult   = input.float(1.8, "Volume x MA",           minval=1.0, step=0.1, group=grpDisp)
-useVWAPgt = input.bool(true, "Displacement Close Above VWAP",     group=grpDisp)
-useFVG    = input.bool(true, "Require Bullish FVG (Imbalance)",   group=grpDisp)
+atrLen    = input.int(14, "ATR Length", minval=2, group=grpDisp)
+atrMult   = input.float(1.8, "Min Range / ATR", minval=0.5, step=0.1, group=grpDisp)
+bodyPct   = input.float(0.65, "Min Body / Range", minval=0.3, maxval=1.0, step=0.05, group=grpDisp)
+volLen    = input.int(20, "Volume MA Length", minval=2, group=grpDisp)
+volMult   = input.float(1.8, "Volume x MA", minval=1.0, step=0.1, group=grpDisp)
+useVWAPgt = input.bool(true, "Displacement Close Above VWAP", group=grpDisp)
+useFVG    = input.bool(true, "Require Bullish FVG (Imbalance)", group=grpDisp)
 
 grpFollow = "Heavy-Buyer Follow-Through"
-useFollow  = input.bool(true,  "Require No-Pullback Follow-Through", group=grpFollow)
-followBars = input.int(2,      "Bars to Confirm",                    minval=1, maxval=5, group=grpFollow)
-maxRetrace = input.float(0.5,  "Max Retrace of Displacement (0-1)",  minval=0.1, maxval=0.9, step=0.05, group=grpFollow)
+useFollow  = input.bool(true, "Require No-Pullback Follow-Through", group=grpFollow)
+followBars = input.int(2, "Bars to Confirm", minval=1, maxval=5, group=grpFollow)
+maxRetrace = input.float(0.5, "Max Retrace of Displacement (0-1)", minval=0.1, maxval=0.9, step=0.05, group=grpFollow)
 
 grpZone = "Zone & Day Bias"
-zoneType    = input.string("Body+Lower Wick", "Zone Construction",
-                 options=["Body Only","Body+Lower Wick","50% Equilibrium"], group=grpZone)
-extendRight = input.bool(true,  "Extend Zone to the Right",                group=grpZone)
-showMid     = input.bool(true,  "Show 50% Equilibrium Line",               group=grpZone)
-invalClose  = input.bool(true,  "Invalidate When Close Below Zone",        group=grpZone)
-lockBias    = input.bool(true,  "Lock Day Bias = LONG Until Invalidated",  group=grpZone)
-showBanner  = input.bool(true,  "Show TRENDING-DAY Banner",                group=grpZone)
-showBg      = input.bool(true,  "Tint Background on Trend Day",            group=grpZone)
+zoneType    = input.string("Body+Lower Wick", "Zone Construction", options=["Body Only","Body+Lower Wick","50% Equilibrium"], group=grpZone)
+extendRight = input.bool(true, "Extend Zone to the Right", group=grpZone)
+showMid     = input.bool(true, "Show 50% Equilibrium Line", group=grpZone)
+invalClose  = input.bool(true, "Invalidate When Close Below Zone", group=grpZone)
+lockBias    = input.bool(true, "Lock Day Bias = LONG Until Invalidated", group=grpZone)
+showBanner  = input.bool(true, "Show TRENDING-DAY Banner", group=grpZone)
+showBg      = input.bool(true, "Tint Background on Trend Day", group=grpZone)
 
 grpStyle = "Visual Style"
-zoneFill = input.color(color.new(#00e676, 78), "Zone Fill",           group=grpStyle)
-zoneBord = input.color(#00e676,                "Zone Border",         group=grpStyle)
+zoneFill = input.color(color.new(#00e676, 78), "Zone Fill", group=grpStyle)
+zoneBord = input.color(#00e676, "Zone Border", group=grpStyle)
 zoneText = input.string("STRONG DEMAND  BANK BUYING ZONE", "Zone Label", group=grpStyle)
 biasBg   = input.color(color.new(#00c853, 92), "Trend-Up Background", group=grpStyle)
 
 grpAlert = "Alerts"
-alertForm   = input.bool(true, "Alert on Zone Formation",   group=grpAlert)
-alertRetest = input.bool(true, "Alert on First Retest",     group=grpAlert)
-alertInval  = input.bool(true, "Alert on Zone Invalidation",group=grpAlert)
+alertForm   = input.bool(true, "Alert on Zone Formation", group=grpAlert)
+alertRetest = input.bool(true, "Alert on First Retest", group=grpAlert)
+alertInval  = input.bool(true, "Alert on Zone Invalidation", group=grpAlert)
 
 // -----------------------------------------------------------------------------
-//  CORE CALCULATIONS
+//  CORE
 // -----------------------------------------------------------------------------
 atr   = ta.atr(atrLen)
 volMa = ta.sma(volume, volLen)
@@ -92,60 +70,51 @@ rng   = high - low
 body  = math.abs(close - open)
 vwap  = ta.vwap(hlc3)
 
-// Session detection
 sessTimeMs = time(timeframe.period, sessTime, sessTZ)
-inSess     = (not useSession) or not na(sessTimeMs)
+inSess = (not useSession) or not na(sessTimeMs)
 isFirstSessBar = inSess and not nz(inSess[1], false)
 
-// Compression (excluding current bar)
-avgRng       = ta.sma(rng, accumLen)[1]
+avgRng = ta.sma(rng, accumLen)[1]
 isCompressed = (not useAccum) or (not na(avgRng) and avgRng <= atr * accumRatio)
 
-// Opening Range (built during first orMins of the session)
+// Opening Range
 var float orHigh    = na
 var float orLow     = na
 var int   orStartMs = na
 if isFirstSessBar
     orStartMs := time
-    orHigh    := high
-    orLow     := low
+    orHigh := high
+    orLow  := low
 else if not na(orStartMs) and time <= orStartMs + orMins * 60 * 1000 and inSess
     orHigh := math.max(nz(orHigh, high), high)
     orLow  := math.min(nz(orLow,  low),  low)
 if not inSess
     orStartMs := na
 
-// Previous Day Low
 pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
 
-// Swing low lookback (excluding current bar so it's non-repainting at confirmation)
 swingLow = ta.lowest(low, sweepLen)[1]
 
-// Sweep conditions
-sweepSwing = useSwing and not na(swingLow)        and (low < swingLow)
-sweepOR    = useORL   and not na(orLow)           and (low < orLow)
-sweepPDL   = usePDL   and not na(pdl)             and (low < pdl)
+sweepSwing = useSwing and not na(swingLow) and (low < swingLow)
+sweepOR    = useORL   and not na(orLow)    and (low < orLow)
+sweepPDL   = usePDL   and not na(pdl)      and (low < pdl)
 sweepHit   = sweepSwing or sweepOR or sweepPDL
 sweepOk    = (not requireSweep) or sweepHit
 
-// Institutional displacement candle
 isDisp  = rng > atr * atrMult and body >= rng * bodyPct and volume >= volMa * volMult and close > open
 vwapOk  = (not useVWAPgt) or (close > vwap)
 bullFVG = low > high[2]
 fvgOk   = (not useFVG) or bullFVG
 
-// Final demand setup trigger (evaluated only on confirmed bars)
 demandSetup = barstate.isconfirmed and inSess and isCompressed and sweepOk and isDisp and vwapOk and fvgOk
 
 // -----------------------------------------------------------------------------
 //  FOLLOW-THROUGH STATE MACHINE
-//  Pending displacement candle waits N confirmed bars without breaching
-//  (displacementHigh - maxRetrace * displacementRange) before the zone is born.
 // -----------------------------------------------------------------------------
-var float pTop     = na   // displacement candle high
-var float pBot     = na   // displacement candle low (wick)
-var float pBodyTop = na   // close
-var float pBodyBot = na   // open
+var float pTop     = na
+var float pBot     = na
+var float pBodyTop = na
+var float pBodyBot = na
 var int   pBar     = na
 var int   pLeft    = 0
 var bool  pFailed  = false
@@ -153,13 +122,13 @@ var bool  pFailed  = false
 zoneJustFormed = false
 
 if demandSetup and na(pBar)
-    pTop     := high
-    pBot     := low
+    pTop := high
+    pBot := low
     pBodyTop := close
     pBodyBot := open
-    pBar     := bar_index
-    pLeft    := useFollow ? followBars : 0
-    pFailed  := false
+    pBar  := bar_index
+    pLeft := useFollow ? followBars : 0
+    pFailed := false
     if not useFollow
         zoneJustFormed := true
 
@@ -171,7 +140,7 @@ if not na(pBar) and bar_index > pBar and pLeft > 0 and not pFailed and barstate.
         pBar    := na
         pLeft   := 0
     else
-        pLeft -= 1
+        pLeft := pLeft - 1
         if pLeft == 0
             zoneJustFormed := true
 
@@ -192,16 +161,11 @@ var array<Zone> zones = array.new<Zone>()
 
 f_drawZone(float _top, float _bot, int _bar) =>
     rightX = extendRight ? bar_index + 500 : bar_index + 30
-    bx = box.new(left=_bar, top=_top, right=rightX, bottom=_bot,
-         border_color=zoneBord, border_width=2, bgcolor=zoneFill,
-         extend=extendRight ? extend.right : extend.none)
+    extOpt = extendRight ? extend.right : extend.none
+    bx = box.new(left=_bar, top=_top, right=rightX, bottom=_bot, border_color=zoneBord, border_width=2, bgcolor=zoneFill, extend=extOpt)
     mid = (_top + _bot) / 2.0
-    ml  = showMid ? line.new(_bar, mid, rightX, mid, color=color.new(zoneBord, 30),
-              style=line.style_dotted, width=1,
-              extend=extendRight ? extend.right : extend.none) : na
-    lb = label.new(_bar, _bot, zoneText + "  ★",
-         style=label.style_label_up,
-         color=color.new(zoneBord, 0), textcolor=color.white, size=size.small)
+    ml = showMid ? line.new(_bar, mid, rightX, mid, color=color.new(zoneBord, 30), style=line.style_dotted, width=1, extend=extOpt) : na
+    lb = label.new(_bar, _bot, zoneText, style=label.style_label_up, color=color.new(zoneBord, 0), textcolor=color.white, size=size.small)
     Zone.new(bx, ml, lb, _top, _bot, _bar, false, true)
 
 // -----------------------------------------------------------------------------
@@ -212,26 +176,18 @@ isNewDay = ta.change(time("D")) != 0
 if isNewDay
     trendUpDay := false
 
-// -----------------------------------------------------------------------------
-//  CREATE ZONE WHEN FOLLOW-THROUGH CONFIRMS
-// -----------------------------------------------------------------------------
 if zoneJustFormed
-    zTop = zoneType == "Body Only"        ? math.max(pBodyTop, pBodyBot) :
-           zoneType == "Body+Lower Wick"  ? math.max(pBodyTop, pBodyBot) :
-                                            (pTop + pBot) / 2.0
-    zBot = zoneType == "Body Only"        ? math.min(pBodyTop, pBodyBot) :
-           zoneType == "Body+Lower Wick"  ? pBot :
-                                            pBot
+    zTop = zoneType == "50% Equilibrium" ? (pTop + pBot) / 2.0 : math.max(pBodyTop, pBodyBot)
+    zBot = zoneType == "Body Only" ? math.min(pBodyTop, pBodyBot) : pBot
     z = f_drawZone(zTop, zBot, pBar)
     array.push(zones, z)
     if lockBias
         trendUpDay := true
-    // Reset pending tracker
     pBar  := na
     pLeft := 0
 
 // -----------------------------------------------------------------------------
-//  ZONE MANAGEMENT: touch, invalidation, intraday expiry
+//  ZONE MANAGEMENT
 // -----------------------------------------------------------------------------
 var bool retestAlertFire = false
 var bool invalAlertFire  = false
@@ -243,8 +199,6 @@ if array.size(zones) > 0
         z = array.get(zones, i)
         if not z.alive
             continue
-
-        // Intraday expiry
         if intradayOnly and isNewDay and bar_index > z.created
             z.alive := false
             box.delete(z.bx)
@@ -254,8 +208,6 @@ if array.size(zones) > 0
                 label.delete(z.lbl)
             array.set(zones, i, z)
             continue
-
-        // Invalidation: heavy-buyer thesis broken if price closes below zone
         if invalClose and close < z.bot
             z.alive := false
             box.set_bgcolor(z.bx, color.new(color.gray, 90))
@@ -267,8 +219,6 @@ if array.size(zones) > 0
                 trendUpDay := false
             array.set(zones, i, z)
             continue
-
-        // First-touch retest
         touchedNow = low <= z.top and high >= z.bot
         if touchedNow and not z.touched
             z.touched := true
@@ -276,57 +226,34 @@ if array.size(zones) > 0
             array.set(zones, i, z)
 
 // -----------------------------------------------------------------------------
-//  VISUAL: trend-day background tint + status banner
+//  VISUALS
 // -----------------------------------------------------------------------------
 bgcolor(showBg and trendUpDay ? biasBg : na, title="Trend-Up Day BG")
 
 var table biasTbl = table.new(position.top_right, 1, 2, border_width=1)
-if barstate.islast
-    if showBanner
-        statusTxt = trendUpDay ? "TRENDING UP DAY ★  BUY THE DIPS" : "NO STRONG DEMAND YET"
-        statusBg  = trendUpDay ? color.new(#00c853, 0) : color.new(color.gray, 40)
-        table.cell(biasTbl, 0, 0, statusTxt,
-             bgcolor=statusBg, text_color=color.white, text_size=size.large)
-        subTxt = trendUpDay ?
-             "Heavy buyers locked in — one-sided up move expected" :
-             "Waiting for compression + sweep + displacement + follow-through"
-        table.cell(biasTbl, 0, 1, subTxt,
-             bgcolor=color.new(color.black, 70),
-             text_color=color.white, text_size=size.small)
+if barstate.islast and showBanner
+    statusTxt = trendUpDay ? "TRENDING UP DAY  BUY THE DIPS" : "NO STRONG DEMAND YET"
+    statusBg  = trendUpDay ? color.new(#00c853, 0) : color.new(color.gray, 40)
+    table.cell(biasTbl, 0, 0, statusTxt, bgcolor=statusBg, text_color=color.white, text_size=size.large)
+    subTxt = trendUpDay ? "Heavy buyers locked in - one-sided up move expected" : "Waiting for compression + sweep + displacement + follow-through"
+    table.cell(biasTbl, 0, 1, subTxt, bgcolor=color.new(color.black, 70), text_color=color.white, text_size=size.small)
 
-// -----------------------------------------------------------------------------
-//  PLOTS / DEBUG MARKERS
-// -----------------------------------------------------------------------------
 plot(useVWAPgt ? vwap : na, "VWAP", color=color.new(color.orange, 0), linewidth=1)
-plot(useORL    ? orLow : na, "Opening Range Low",
-     color=color.new(color.gray, 30), style=plot.style_linebr, linewidth=1)
-plot(usePDL    ? pdl   : na, "Previous Day Low",
-     color=color.new(color.silver, 30), style=plot.style_linebr, linewidth=1)
+plot(useORL    ? orLow : na, "Opening Range Low", color=color.new(color.gray, 30), style=plot.style_linebr, linewidth=1)
+plot(usePDL    ? pdl   : na, "Previous Day Low", color=color.new(color.silver, 30), style=plot.style_linebr, linewidth=1)
 
-plotshape(zoneJustFormed, title="Strong Demand Born", style=shape.triangleup,
-     location=location.belowbar, color=color.new(#00e676, 0), size=size.small,
-     text="STRONG\nDEMAND")
+plotshape(zoneJustFormed, title="Strong Demand Born", style=shape.triangleup, location=location.belowbar, color=color.new(#00e676, 0), size=size.small, text="STRONG\nDEMAND")
 
 // -----------------------------------------------------------------------------
 //  ALERTS
 // -----------------------------------------------------------------------------
 if alertForm and zoneJustFormed
-    alert("STRONG DEMAND ZONE formed — Heavy buyers active — TRENDING UP DAY",
-         alert.freq_once_per_bar)
+    alert("STRONG DEMAND ZONE formed - Heavy buyers active - TRENDING UP DAY", alert.freq_once_per_bar)
 if alertRetest and retestAlertFire
-    alert("Strong Demand Zone retest — Possible long entry",
-         alert.freq_once_per_bar)
+    alert("Strong Demand Zone retest - Possible long entry", alert.freq_once_per_bar)
 if alertInval and invalAlertFire
-    alert("Strong Demand Zone INVALIDATED — Bias void",
-         alert.freq_once_per_bar)
+    alert("Strong Demand Zone INVALIDATED - Bias void", alert.freq_once_per_bar)
 
-alertcondition(zoneJustFormed,  title="Strong Demand Formed",
-     message="STRONG DEMAND ZONE formed — Heavy buyers active — TRENDING UP DAY")
-alertcondition(retestAlertFire, title="Strong Demand Retest",
-     message="Strong Demand Zone retest — Possible long entry")
-alertcondition(invalAlertFire,  title="Strong Demand Invalidated",
-     message="Strong Demand Zone INVALIDATED — Bias void")
-
-// =============================================================================
-//  END
-// =============================================================================
+alertcondition(zoneJustFormed,  title="Strong Demand Formed",      message="STRONG DEMAND ZONE formed - Heavy buyers active - TRENDING UP DAY")
+alertcondition(retestAlertFire, title="Strong Demand Retest",      message="Strong Demand Zone retest - Possible long entry")
+alertcondition(invalAlertFire,  title="Strong Demand Invalidated", message="Strong Demand Zone INVALIDATED - Bias void")
