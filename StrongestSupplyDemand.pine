@@ -1,0 +1,303 @@
+//@version=5
+// =============================================================================
+//  Strongest Demand & Supply Zones - Intraday Heavy Player Areas
+//  Pine v5 | Non-repainting | Non-floating (zone coords locked at creation)
+//
+//  STRENGTH SCORE (0-10) gates which zones survive. Only the absolute
+//  strongest institutional candles draw a zone. Bounce-confirmation tag
+//  ("PROVEN") fires once price has rejected the zone by >= N ATRs.
+// =============================================================================
+indicator("Strongest Demand & Supply Zones - Intraday Heavy Players", shorttitle="STRONGEST S/D", overlay=true, max_boxes_count=300, max_lines_count=300, max_labels_count=300)
+
+// ===== INPUTS =====
+g1 = "Strength Filter"
+minScore  = input.int(7, "Min Strength Score (0-10)", minval=1, maxval=10, group=g1)
+showScore = input.bool(true, "Show Score Badge on Zone", group=g1)
+
+g2 = "Displacement Candle"
+atrLen   = input.int(14, "ATR Length", minval=2, group=g2)
+atrMult  = input.float(1.6, "Min Range / ATR", minval=0.5, step=0.1, group=g2)
+volLen   = input.int(20, "Volume MA Length", minval=2, group=g2)
+volMult  = input.float(1.6, "Min Volume / MA", minval=1.0, step=0.1, group=g2)
+bodyPct  = input.float(0.6, "Min Body / Range", minval=0.3, maxval=1.0, step=0.05, group=g2)
+
+g3 = "Structure & Liquidity (scoring)"
+pivotLen  = input.int(5, "Structure Pivot Length", minval=2, group=g3)
+useFVG    = input.bool(true, "Score: FVG Imbalance", group=g3)
+useBOS    = input.bool(true, "Score: Break of Structure", group=g3)
+useSweep  = input.bool(true, "Score: Liquidity Sweep", group=g3)
+useHTF    = input.bool(true, "Score: HTF Candle Alignment", group=g3)
+htfRes    = input.timeframe("60", "HTF Resolution", group=g3)
+useKeyLvl = input.bool(true, "Score: Near Key Level (PDH/PDL/ORH/ORL)", group=g3)
+orMins    = input.int(15, "Opening Range Mins", minval=5, group=g3)
+
+g4 = "Zone Behaviour"
+sessionFilter = input.bool(false, "Restrict Detection to Session", group=g4)
+sessTime      = input.session("0915-1500", "Session", group=g4)
+sessTZ        = input.string("Asia/Kolkata", "Timezone", options=["Asia/Kolkata","America/New_York","Europe/London","exchange"], group=g4)
+intradayOnly  = input.bool(true, "Auto-Expire Zones Next Day", group=g4)
+extendRight   = input.bool(true, "Extend Zones Right", group=g4)
+showMid       = input.bool(true, "Show Equilibrium Midline", group=g4)
+maxZones      = input.int(6, "Max Active Zones Per Side", minval=1, maxval=20, group=g4)
+
+g5 = "Bounce / Invalidation"
+bounceBars       = input.int(3, "Bars to Confirm Bounce", minval=1, maxval=10, group=g5)
+bounceAtr        = input.float(0.6, "Min Bounce Distance (ATRs)", minval=0.1, step=0.1, group=g5)
+invalCloseBeyond = input.bool(true, "Invalidate When Close Beyond Zone", group=g5)
+
+g6 = "Style"
+demFill    = input.color(color.new(#00e676, 75), "Demand Fill", group=g6)
+demBord    = input.color(#00c853, "Demand Border", group=g6)
+supFill    = input.color(color.new(#ff1744, 75), "Supply Fill", group=g6)
+supBord    = input.color(#d50000, "Supply Border", group=g6)
+demTxt     = input.string("HEAVY BUYERS", "Demand Label", group=g6)
+supTxt     = input.string("HEAVY SELLERS", "Supply Label", group=g6)
+showLabels = input.bool(true, "Show Labels", group=g6)
+
+g7 = "Alerts"
+alertForm   = input.bool(true, "Alert on Strongest Zone Formed", group=g7)
+alertTouch  = input.bool(true, "Alert on Zone Touch", group=g7)
+alertBounce = input.bool(true, "Alert on Confirmed Bounce", group=g7)
+alertInval  = input.bool(true, "Alert on Zone Invalidation", group=g7)
+
+// ===== CORE =====
+atr   = ta.atr(atrLen)
+volMa = ta.sma(volume, volLen)
+rng   = high - low
+body  = math.abs(close - open)
+bullCandle = close > open
+bearCandle = close < open
+
+// session
+sessTimeMs = time(timeframe.period, sessTime, sessTZ)
+inSess = (not sessionFilter) or not na(sessTimeMs)
+isFirstSess = inSess and not nz(inSess[1], false)
+
+// HTF candle direction
+htfO = request.security(syminfo.tickerid, htfRes, open,  lookahead=barmerge.lookahead_off)
+htfC = request.security(syminfo.tickerid, htfRes, close, lookahead=barmerge.lookahead_off)
+htfBull = htfC > htfO
+htfBear = htfC < htfO
+
+// Previous day H/L
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+
+// Opening Range (built once per session, frozen after orMins)
+var float orH = na
+var float orL = na
+var int   orStart = na
+if isFirstSess
+    orStart := time
+    orH := high
+    orL := low
+else if not na(orStart) and time <= orStart + orMins * 60 * 1000 and inSess
+    orH := math.max(nz(orH, high), high)
+    orL := math.min(nz(orL, low),  low)
+if not inSess
+    orStart := na
+
+// Pivots & BOS
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+bosUp = not na(lastPH) and close > lastPH and close[1] <= lastPH
+bosDn = not na(lastPL) and close < lastPL and close[1] >= lastPL
+
+// FVG (3-candle imbalance, evaluated on confirmed bar)
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+// Liquidity sweep
+swingLow  = ta.lowest(low,  pivotLen * 2)[1]
+swingHigh = ta.highest(high, pivotLen * 2)[1]
+sweepDn = not na(swingLow)  and low  < swingLow
+sweepUp = not na(swingHigh) and high > swingHigh
+
+// Key-level proximity
+nearKeyDem = (not na(pdl) and math.abs(low - pdl) <= atr * 0.5) or (not na(orL) and math.abs(low - orL) <= atr * 0.5)
+nearKeySup = (not na(pdh) and math.abs(high - pdh) <= atr * 0.5) or (not na(orH) and math.abs(high - orH) <= atr * 0.5)
+
+// Base displacement
+isBigBody  = body >= rng * bodyPct
+isBigRange = rng > atr * atrMult
+isBigVol   = volume >= volMa * volMult
+baseDispBull = isBigBody and isBigRange and isBigVol and bullCandle
+baseDispBear = isBigBody and isBigRange and isBigVol and bearCandle
+
+// Strength score 0..10
+f_score(bool _isDem) =>
+    sVol  = volume >= volMa * volMult * 1.25 ? 2 : 1
+    sRng  = rng > atr * atrMult * 1.25 ? 2 : 1
+    sBdy  = body >= rng * 0.7 ? 1 : 0
+    sBOS  = (useBOS   and (_isDem ? bosUp   : bosDn))   ? 1 : 0
+    sFVG  = (useFVG   and (_isDem ? bullFVG : bearFVG)) ? 1 : 0
+    sSwp  = (useSweep and (_isDem ? sweepDn : sweepUp)) ? 1 : 0
+    sHTF  = (useHTF   and (_isDem ? htfBull : htfBear)) ? 1 : 0
+    sKey  = (useKeyLvl and (_isDem ? nearKeyDem : nearKeySup)) ? 1 : 0
+    sVol + sRng + sBdy + sBOS + sFVG + sSwp + sHTF + sKey
+
+scoreDem = baseDispBull ? f_score(true)  : 0
+scoreSup = baseDispBear ? f_score(false) : 0
+
+confirmDemand = barstate.isconfirmed and inSess and baseDispBull and scoreDem >= minScore
+confirmSupply = barstate.isconfirmed and inSess and baseDispBear and scoreSup >= minScore
+
+// ===== ZONE STORAGE =====
+type Zone
+    box   bx
+    line  midL
+    label lbl
+    label scoreLbl
+    float top
+    float bot
+    int   created
+    int   score
+    bool  isDem
+    bool  touched
+    bool  bounced
+    int   touchBar
+    bool  alive
+
+var array<Zone> zones = array.new<Zone>()
+
+// Drawings are anchored with xloc=xloc.bar_index so coords reference the
+// underlying bar (not pixels / time). Right edge starts at the current
+// bar; extend=extend.right makes it grow infinitely without redrawing.
+f_drawZone(bool _isDem, float _top, float _bot, int _bar, int _score) =>
+    extOpt = extendRight ? extend.right : extend.none
+    fill = _isDem ? demFill : supFill
+    bord = _isDem ? demBord : supBord
+    bx = box.new(left=_bar, top=_top, right=bar_index, bottom=_bot, xloc=xloc.bar_index, border_color=bord, border_width=2, bgcolor=fill, extend=extOpt)
+    mid = (_top + _bot) / 2.0
+    ml = showMid ? line.new(_bar, mid, bar_index, mid, xloc=xloc.bar_index, color=color.new(bord, 30), style=line.style_dotted, width=1, extend=extOpt) : na
+    lb = showLabels ? label.new(_bar, _isDem ? _bot : _top, _isDem ? demTxt : supTxt, xloc=xloc.bar_index, style=_isDem ? label.style_label_up : label.style_label_down, color=color.new(bord, 0), textcolor=color.white, size=size.small) : na
+    scLbl = showScore ? label.new(_bar, _isDem ? _top : _bot, "Score " + str.tostring(_score) + "/10", xloc=xloc.bar_index, style=label.style_label_left, color=color.new(bord, 20), textcolor=color.white, size=size.tiny) : na
+    Zone.new(bx, ml, lb, scLbl, _top, _bot, _bar, _score, _isDem, false, false, na, true)
+
+f_capZones(bool _isDem) =>
+    cnt = 0
+    for i = array.size(zones) - 1 to 0
+        zi = array.get(zones, i)
+        if zi.alive and zi.isDem == _isDem
+            cnt := cnt + 1
+    if cnt > maxZones
+        for i = 0 to array.size(zones) - 1
+            zj = array.get(zones, i)
+            if zj.alive and zj.isDem == _isDem
+                zj.alive := false
+                box.delete(zj.bx)
+                if not na(zj.midL)
+                    line.delete(zj.midL)
+                if not na(zj.lbl)
+                    label.delete(zj.lbl)
+                if not na(zj.scoreLbl)
+                    label.delete(zj.scoreLbl)
+                array.set(zones, i, zj)
+                break
+
+// Create new zones (coords frozen at creation -> non-floating)
+if confirmDemand
+    topZ = math.max(open, close)
+    botZ = math.min(open, low)
+    z = f_drawZone(true, topZ, botZ, bar_index, scoreDem)
+    array.push(zones, z)
+    f_capZones(true)
+
+if confirmSupply
+    topZ = math.max(open, high)
+    botZ = math.min(open, close)
+    z = f_drawZone(false, topZ, botZ, bar_index, scoreSup)
+    array.push(zones, z)
+    f_capZones(false)
+
+// ===== ZONE MANAGEMENT =====
+isNewDay = ta.change(time("D")) != 0
+var bool formedAlertFire = false
+var bool touchAlertFire  = false
+var bool bounceAlertFire = false
+var bool invalAlertFire  = false
+formedAlertFire := false
+touchAlertFire  := false
+bounceAlertFire := false
+invalAlertFire  := false
+
+if confirmDemand or confirmSupply
+    formedAlertFire := true
+
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        z = array.get(zones, i)
+        if not z.alive
+            continue
+        // Anchor refresh: keep the right edge tracking the latest bar so
+        // zones stay locked to candles and never drift when scrolling.
+        box.set_right(z.bx, bar_index)
+        if not na(z.midL)
+            line.set_x2(z.midL, bar_index)
+        // Intraday expiry
+        if intradayOnly and isNewDay and bar_index > z.created
+            z.alive := false
+            box.delete(z.bx)
+            if not na(z.midL)
+                line.delete(z.midL)
+            if not na(z.lbl)
+                label.delete(z.lbl)
+            if not na(z.scoreLbl)
+                label.delete(z.scoreLbl)
+            array.set(zones, i, z)
+            continue
+        // Invalidation
+        invalidated = false
+        if invalCloseBeyond
+            if z.isDem and close < z.bot
+                invalidated := true
+            if (not z.isDem) and close > z.top
+                invalidated := true
+        if invalidated
+            z.alive := false
+            box.set_bgcolor(z.bx, color.new(color.gray, 90))
+            box.set_border_color(z.bx, color.new(color.gray, 50))
+            if not na(z.midL)
+                line.delete(z.midL)
+            invalAlertFire := true
+            array.set(zones, i, z)
+            continue
+        // First touch
+        touched = low <= z.top and high >= z.bot
+        if touched and not z.touched
+            z.touched := true
+            z.touchBar := bar_index
+            touchAlertFire := true
+            array.set(zones, i, z)
+        // Bounce confirmation within bounceBars after touch
+        if z.touched and not z.bounced and not na(z.touchBar) and bar_index > z.touchBar and (bar_index - z.touchBar) <= bounceBars
+            bouncedDem = z.isDem and (high - z.top) >= atr * bounceAtr
+            bouncedSup = (not z.isDem) and (z.bot - low) >= atr * bounceAtr
+            if bouncedDem or bouncedSup
+                z.bounced := true
+                bounceAlertFire := true
+                box.set_border_width(z.bx, 4)
+                if not na(z.lbl)
+                    label.set_text(z.lbl, (z.isDem ? demTxt : supTxt) + "  *PROVEN*")
+                array.set(zones, i, z)
+
+// ===== ALERTS =====
+if alertForm and formedAlertFire
+    alert("STRONGEST Zone formed - heavy player footprint", alert.freq_once_per_bar)
+if alertTouch and touchAlertFire
+    alert("Strongest Zone touched - watch for bounce", alert.freq_once_per_bar)
+if alertBounce and bounceAlertFire
+    alert("Bounce CONFIRMED off Strongest Zone", alert.freq_once_per_bar)
+if alertInval and invalAlertFire
+    alert("Strongest Zone INVALIDATED", alert.freq_once_per_bar)
+
+alertcondition(formedAlertFire, title="Strongest Zone Formed",  message="STRONGEST Zone formed - heavy player footprint")
+alertcondition(touchAlertFire,  title="Strongest Zone Touch",   message="Strongest Zone touched - watch for bounce")
+alertcondition(bounceAlertFire, title="Bounce Confirmed",       message="Bounce CONFIRMED off Strongest Zone")
+alertcondition(invalAlertFire,  title="Zone Invalidated",       message="Strongest Zone INVALIDATED")

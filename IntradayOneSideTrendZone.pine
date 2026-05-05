@@ -1,0 +1,348 @@
+//@version=5
+// =============================================================================
+//  Intraday One-Side Trend Day Zone - Strongest
+//  Pine v5 | Non-repainting | Non-floating (xloc.bar_index, right refreshed)
+//
+//  Once the strongest demand or supply zone is locked in, the script fixes
+//  the day-bias to UP or DOWN. Heavy buyers / sellers stay engaged, so the
+//  expectation is a one-directional trend until close-beyond invalidates it.
+// =============================================================================
+indicator("Intraday One-Side Trend Day Zone - Strongest", shorttitle="ONE-SIDE DAY", overlay=true, max_boxes_count=200, max_lines_count=200, max_labels_count=200)
+
+// ===== INPUTS =====
+g1 = "Session / Time"
+useSession = input.bool(true, "Detect Only In Session Window", group=g1)
+sessTime   = input.session("0915-1230", "Session Window (Early Move)", group=g1)
+sessTZ     = input.string("Asia/Kolkata", "Session Timezone", options=["Asia/Kolkata","America/New_York","Europe/London","exchange"], group=g1)
+
+g2 = "Strength Filter"
+minScore  = input.int(7, "Min Strength Score (0-10)", minval=1, maxval=10, group=g2)
+showScore = input.bool(true, "Show Score Badge", group=g2)
+detectDem = input.bool(true, "Detect Demand (Up-Day)", group=g2)
+detectSup = input.bool(true, "Detect Supply (Down-Day)", group=g2)
+
+g3 = "Pre-Move Compression"
+useAccum   = input.bool(true, "Require Compression Before Move", group=g3)
+accumLen   = input.int(8, "Compression Lookback (bars)", minval=3, group=g3)
+accumRatio = input.float(0.7, "Max Avg-Range / ATR", minval=0.2, step=0.05, group=g3)
+
+g4 = "Liquidity Sweep (scoring)"
+useSwing    = input.bool(true, "Sweep Prior Swing High/Low", group=g4)
+sweepLen    = input.int(10, "Swing Lookback", minval=3, group=g4)
+useORLevels = input.bool(true, "Sweep Opening Range H/L", group=g4)
+orMins      = input.int(15, "Opening Range Mins", minval=5, group=g4)
+usePDLevels = input.bool(false, "Sweep Previous Day H/L", group=g4)
+
+g5 = "Displacement Candle"
+atrLen   = input.int(14, "ATR Length", minval=2, group=g5)
+atrMult  = input.float(1.8, "Min Range / ATR", minval=0.5, step=0.1, group=g5)
+bodyPct  = input.float(0.65, "Min Body / Range", minval=0.3, maxval=1.0, step=0.05, group=g5)
+volLen   = input.int(20, "Volume MA Length", minval=2, group=g5)
+volMult  = input.float(1.8, "Min Volume / MA", minval=1.0, step=0.1, group=g5)
+useVWAP  = input.bool(true, "Score: VWAP Side Aligned", group=g5)
+useFVG   = input.bool(true, "Score: FVG Imbalance", group=g5)
+useBOS   = input.bool(true, "Score: Break of Structure", group=g5)
+pivotLen = input.int(5, "Pivot Length (BOS)", minval=2, group=g5)
+useHTF   = input.bool(true, "Score: HTF Candle Aligned", group=g5)
+htfRes   = input.timeframe("60", "HTF Resolution", group=g5)
+
+g6 = "Heavy-Player Follow-Through"
+useFollow  = input.bool(true, "Require No-Pullback Follow-Through", group=g6)
+followBars = input.int(2, "Bars to Confirm", minval=1, maxval=5, group=g6)
+maxRetrace = input.float(0.5, "Max Retrace of Displacement (0-1)", minval=0.1, maxval=0.9, step=0.05, group=g6)
+
+g7 = "Zone & Day-Bias"
+zoneType     = input.string("Body+Wick", "Zone Construction", options=["Body Only","Body+Wick","50% Equilibrium"], group=g7)
+intradayOnly = input.bool(true, "Auto-Expire Zone Next Day", group=g7)
+extendRight  = input.bool(true, "Extend Zone to the Right", group=g7)
+showMid      = input.bool(true, "Show Equilibrium Midline", group=g7)
+invalClose   = input.bool(true, "Invalidate When Close Beyond Zone", group=g7)
+lockBias     = input.bool(true, "Lock Day Bias Until Invalidated", group=g7)
+showBanner   = input.bool(true, "Show TRENDING-DAY Banner", group=g7)
+showBg       = input.bool(true, "Tint Background on Trend Day", group=g7)
+
+g8 = "Style"
+demFill = input.color(color.new(#00e676, 75), "Demand Fill", group=g8)
+demBord = input.color(#00c853, "Demand Border", group=g8)
+supFill = input.color(color.new(#ff1744, 75), "Supply Fill", group=g8)
+supBord = input.color(#d50000, "Supply Border", group=g8)
+demText = input.string("HEAVY BUYERS  UP DAY", "Demand Label", group=g8)
+supText = input.string("HEAVY SELLERS  DOWN DAY", "Supply Label", group=g8)
+upBg    = input.color(color.new(#00c853, 92), "Up-Day Background", group=g8)
+dnBg    = input.color(color.new(#d50000, 92), "Down-Day Background", group=g8)
+
+g9 = "Alerts"
+alertForm  = input.bool(true, "Alert Zone Formed (Bias Lock)", group=g9)
+alertTouch = input.bool(true, "Alert Zone Retest", group=g9)
+alertInval = input.bool(true, "Alert Bias Invalidated", group=g9)
+
+// ===== CORE =====
+atr   = ta.atr(atrLen)
+volMa = ta.sma(volume, volLen)
+rng   = high - low
+body  = math.abs(close - open)
+vwap  = ta.vwap(hlc3)
+bullCandle = close > open
+bearCandle = close < open
+
+sessTimeMs  = time(timeframe.period, sessTime, sessTZ)
+inSess      = (not useSession) or not na(sessTimeMs)
+isFirstSess = inSess and not nz(inSess[1], false)
+
+avgRng       = ta.sma(rng, accumLen)[1]
+isCompressed = (not useAccum) or (not na(avgRng) and avgRng <= atr * accumRatio)
+
+htfO = request.security(syminfo.tickerid, htfRes, open,  lookahead=barmerge.lookahead_off)
+htfC = request.security(syminfo.tickerid, htfRes, close, lookahead=barmerge.lookahead_off)
+htfBull = htfC > htfO
+htfBear = htfC < htfO
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+
+var float orH = na
+var float orL = na
+var int   orStart = na
+if isFirstSess
+    orStart := time
+    orH := high
+    orL := low
+else if not na(orStart) and time <= orStart + orMins * 60 * 1000 and inSess
+    orH := math.max(nz(orH, high), high)
+    orL := math.min(nz(orL, low),  low)
+if not inSess
+    orStart := na
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+bosUp = not na(lastPH) and close > lastPH and close[1] <= lastPH
+bosDn = not na(lastPL) and close < lastPL and close[1] >= lastPL
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+swingLow  = ta.lowest(low,  sweepLen)[1]
+swingHigh = ta.highest(high, sweepLen)[1]
+sweepDn = (useSwing and not na(swingLow) and low < swingLow) or (useORLevels and not na(orL) and low < orL) or (usePDLevels and not na(pdl) and low < pdl)
+sweepUp = (useSwing and not na(swingHigh) and high > swingHigh) or (useORLevels and not na(orH) and high > orH) or (usePDLevels and not na(pdh) and high > pdh)
+
+isBigBody  = body >= rng * bodyPct
+isBigRange = rng > atr * atrMult
+isBigVol   = volume >= volMa * volMult
+baseDispBull = isBigBody and isBigRange and isBigVol and bullCandle
+baseDispBear = isBigBody and isBigRange and isBigVol and bearCandle
+
+f_score(bool _isDem) =>
+    sVol  = volume >= volMa * volMult * 1.25 ? 2 : 1
+    sRng  = rng > atr * atrMult * 1.25 ? 2 : 1
+    sBdy  = body >= rng * 0.7 ? 1 : 0
+    sBOS  = (useBOS  and (_isDem ? bosUp   : bosDn))   ? 1 : 0
+    sFVG  = (useFVG  and (_isDem ? bullFVG : bearFVG)) ? 1 : 0
+    sSwp  = (_isDem ? sweepDn : sweepUp) ? 1 : 0
+    sHTF  = (useHTF  and (_isDem ? htfBull : htfBear)) ? 1 : 0
+    sVWAP = (useVWAP and (_isDem ? close > vwap : close < vwap)) ? 1 : 0
+    sVol + sRng + sBdy + sBOS + sFVG + sSwp + sHTF + sVWAP
+
+scoreDem = baseDispBull ? f_score(true)  : 0
+scoreSup = baseDispBear ? f_score(false) : 0
+
+setupDem = barstate.isconfirmed and inSess and detectDem and isCompressed and baseDispBull and scoreDem >= minScore
+setupSup = barstate.isconfirmed and inSess and detectSup and isCompressed and baseDispBear and scoreSup >= minScore
+
+// ===== FOLLOW-THROUGH STATE MACHINE =====
+var float pTop     = na
+var float pBot     = na
+var float pBodyTop = na
+var float pBodyBot = na
+var int   pBar     = na
+var int   pLeft    = 0
+var bool  pIsDem   = false
+var int   pScore   = 0
+
+zoneFormedDem = false
+zoneFormedSup = false
+
+if (setupDem or setupSup) and na(pBar)
+    pTop     := high
+    pBot     := low
+    pBodyTop := close
+    pBodyBot := open
+    pBar     := bar_index
+    pLeft    := useFollow ? followBars : 0
+    pIsDem   := setupDem
+    pScore   := setupDem ? scoreDem : scoreSup
+    if not useFollow
+        if pIsDem
+            zoneFormedDem := true
+        else
+            zoneFormedSup := true
+
+if not na(pBar) and bar_index > pBar and pLeft > 0 and barstate.isconfirmed
+    dispRng = pTop - pBot
+    if pIsDem
+        minHold = pTop - dispRng * maxRetrace
+        if low < minHold
+            pBar  := na
+            pLeft := 0
+        else
+            pLeft := pLeft - 1
+            if pLeft == 0
+                zoneFormedDem := true
+    else
+        maxHold = pBot + dispRng * maxRetrace
+        if high > maxHold
+            pBar  := na
+            pLeft := 0
+        else
+            pLeft := pLeft - 1
+            if pLeft == 0
+                zoneFormedSup := true
+
+// ===== ZONE STORAGE =====
+type Zone
+    box   bx
+    line  midL
+    label lbl
+    label scoreLbl
+    float top
+    float bot
+    int   created
+    int   score
+    bool  isDem
+    bool  touched
+    bool  alive
+
+var array<Zone> zones = array.new<Zone>()
+
+f_drawZone(bool _isDem, float _top, float _bot, int _bar, int _score) =>
+    extOpt = extendRight ? extend.right : extend.none
+    fill = _isDem ? demFill : supFill
+    bord = _isDem ? demBord : supBord
+    txt  = _isDem ? demText : supText
+    bx = box.new(left=_bar, top=_top, right=bar_index, bottom=_bot, xloc=xloc.bar_index, border_color=bord, border_width=2, bgcolor=fill, extend=extOpt)
+    mid = (_top + _bot) / 2.0
+    ml = showMid ? line.new(_bar, mid, bar_index, mid, xloc=xloc.bar_index, color=color.new(bord, 30), style=line.style_dotted, width=1, extend=extOpt) : na
+    lb = label.new(_bar, _isDem ? _bot : _top, txt, xloc=xloc.bar_index, style=_isDem ? label.style_label_up : label.style_label_down, color=color.new(bord, 0), textcolor=color.white, size=size.small)
+    scLbl = showScore ? label.new(_bar, _isDem ? _top : _bot, "Score " + str.tostring(_score) + "/10", xloc=xloc.bar_index, style=label.style_label_left, color=color.new(bord, 20), textcolor=color.white, size=size.tiny) : na
+    Zone.new(bx, ml, lb, scLbl, _top, _bot, _bar, _score, _isDem, false, true)
+
+// ===== DAY-BIAS LOCK =====
+var int trendBias = 0  // 0 neutral, 1 up, -1 down
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    trendBias := 0
+
+if zoneFormedDem
+    zTop = zoneType == "50% Equilibrium" ? (pTop + pBot) / 2.0 : math.max(pBodyTop, pBodyBot)
+    zBot = zoneType == "Body Only" ? math.min(pBodyTop, pBodyBot) : pBot
+    z = f_drawZone(true, zTop, zBot, pBar, pScore)
+    array.push(zones, z)
+    if lockBias
+        trendBias := 1
+    pBar  := na
+    pLeft := 0
+
+if zoneFormedSup
+    zTop = zoneType == "Body Only" ? math.max(pBodyTop, pBodyBot) : pTop
+    zBot = zoneType == "50% Equilibrium" ? (pTop + pBot) / 2.0 : math.min(pBodyTop, pBodyBot)
+    z = f_drawZone(false, zTop, zBot, pBar, pScore)
+    array.push(zones, z)
+    if lockBias
+        trendBias := -1
+    pBar  := na
+    pLeft := 0
+
+// ===== ZONE MANAGEMENT =====
+var bool formedAlertFire = false
+var bool touchAlertFire  = false
+var bool invalAlertFire  = false
+formedAlertFire := false
+touchAlertFire  := false
+invalAlertFire  := false
+
+if zoneFormedDem or zoneFormedSup
+    formedAlertFire := true
+
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        z = array.get(zones, i)
+        if not z.alive
+            continue
+        // Anchor refresh: keep the right edge tracking the latest bar so
+        // zones stay locked to candles and never drift when scrolling.
+        box.set_right(z.bx, bar_index)
+        if not na(z.midL)
+            line.set_x2(z.midL, bar_index)
+        // Intraday expiry
+        if intradayOnly and isNewDay and bar_index > z.created
+            z.alive := false
+            box.delete(z.bx)
+            if not na(z.midL)
+                line.delete(z.midL)
+            if not na(z.lbl)
+                label.delete(z.lbl)
+            if not na(z.scoreLbl)
+                label.delete(z.scoreLbl)
+            array.set(zones, i, z)
+            continue
+        // Invalidation
+        invalidated = false
+        if invalClose
+            if z.isDem and close < z.bot
+                invalidated := true
+            if (not z.isDem) and close > z.top
+                invalidated := true
+        if invalidated
+            z.alive := false
+            box.set_bgcolor(z.bx, color.new(color.gray, 90))
+            box.set_border_color(z.bx, color.new(color.gray, 50))
+            if not na(z.midL)
+                line.delete(z.midL)
+            invalAlertFire := true
+            if lockBias
+                if z.isDem and trendBias == 1
+                    trendBias := 0
+                if (not z.isDem) and trendBias == -1
+                    trendBias := 0
+            array.set(zones, i, z)
+            continue
+        // Touch / retest
+        touched = low <= z.top and high >= z.bot
+        if touched and not z.touched
+            z.touched := true
+            touchAlertFire := true
+            array.set(zones, i, z)
+
+// ===== VISUALS =====
+bgColor = trendBias == 1 ? upBg : trendBias == -1 ? dnBg : na
+bgcolor(showBg ? bgColor : na, title="Trend Day BG")
+
+var table biasTbl = table.new(position.top_right, 1, 2, border_width=1)
+if barstate.islast and showBanner
+    txt1 = trendBias == 1 ? "TRENDING UP DAY  BUY THE DIPS" : trendBias == -1 ? "TRENDING DOWN DAY  SELL THE RIPS" : "NO BIAS YET"
+    bg1  = trendBias == 1 ? color.new(#00c853, 0) : trendBias == -1 ? color.new(#d50000, 0) : color.new(color.gray, 40)
+    table.cell(biasTbl, 0, 0, txt1, bgcolor=bg1, text_color=color.white, text_size=size.large)
+    txt2 = trendBias == 1 ? "Heavy buyers locked in - one-side up move" : trendBias == -1 ? "Heavy sellers locked in - one-side down move" : "Waiting for compression + sweep + displacement + follow-through"
+    table.cell(biasTbl, 0, 1, txt2, bgcolor=color.new(color.black, 70), text_color=color.white, text_size=size.small)
+
+plot(useVWAP ? vwap : na, "VWAP", color=color.new(color.orange, 0), linewidth=1)
+plotshape(zoneFormedDem, title="Demand Zone Born", style=shape.triangleup,   location=location.belowbar, color=color.new(#00e676, 0), size=size.small, text="UP DAY")
+plotshape(zoneFormedSup, title="Supply Zone Born", style=shape.triangledown, location=location.abovebar, color=color.new(#ff1744, 0), size=size.small, text="DOWN DAY")
+
+// ===== ALERTS =====
+if alertForm and formedAlertFire
+    alert("STRONGEST Zone formed - One-Side Trending Day locked", alert.freq_once_per_bar)
+if alertTouch and touchAlertFire
+    alert("Strongest Zone retest - Possible trend continuation entry", alert.freq_once_per_bar)
+if alertInval and invalAlertFire
+    alert("Strongest Zone INVALIDATED - bias void", alert.freq_once_per_bar)
+
+alertcondition(formedAlertFire, title="One-Side Day Locked", message="STRONGEST Zone formed - One-Side Trending Day locked")
+alertcondition(touchAlertFire,  title="Zone Retest",         message="Strongest Zone retest - Possible trend continuation entry")
+alertcondition(invalAlertFire,  title="Bias Invalidated",    message="Strongest Zone INVALIDATED - bias void")
