@@ -2,44 +2,43 @@
 // https://creativecommons.org/licenses/by-nc-sa/4.0/
 
 //@version=5
-indicator('Market Structure — HH HL LH LL [Non-Repainting]', 'MS Labels',
+indicator("Market Structure - HH HL LH LL [Non-Repainting]", "MS Labels",
      overlay          = true,
      max_labels_count = 500,
      max_lines_count  = 500,
      max_boxes_count  = 200)
 
-//─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // INPUTS
-//─────────────────────────────────────────────────────────────────────────────
-leftLen      = input.int(  10,    'Pivot Left Bars',       minval=1,  group='Pivot Settings',
-                 tooltip='Bars to the left of a pivot that must be lower/higher to confirm it')
-rightLen     = input.int(  10,    'Pivot Right Bars',      minval=1,  group='Pivot Settings',
-                 tooltip='Bars to the right required to confirm a pivot — sets the confirmation lag')
-labelSz      = input.string(size.small, 'Label Size',
-                 options=[size.tiny, size.small, size.normal], group='Display')
-showLines    = input.bool( true,  'Structure Lines',       group='Display')
-showRevZone  = input.bool( true,  'Reversal Zone Labels',  group='Display')
+// -----------------------------------------------------------------------------
+leftLen     = input.int(10,  "Pivot Left Bars",  minval = 1, group = "Pivot Settings",
+                 tooltip = "Bars to the left that must be lower/higher to confirm the pivot")
+rightLen    = input.int(10,  "Pivot Right Bars", minval = 1, group = "Pivot Settings",
+                 tooltip = "Bars to the right required to confirm -- this is the confirmation lag")
+labelSz     = input.string(size.small, "Label Size",
+                 options = [size.tiny, size.small, size.normal], group = "Display")
+showLines   = input.bool(true,  "Structure Lines",      group = "Display")
+showRevZone = input.bool(true,  "Reversal Zone Labels", group = "Display")
 
-bullCol      = input.color(#089981, 'Bullish (HH / HL)',     group='Colors')
-bearCol      = input.color(#F23645, 'Bearish (LH / LL)',     group='Colors')
-revBullCol   = input.color(color.new(#089981, 55), 'Bullish Reversal Zone', group='Colors')
-revBearCol   = input.color(color.new(#F23645, 55), 'Bearish Reversal Zone', group='Colors')
+bullCol     = input.color(#089981, "Bullish (HH / HL)",      group = "Colors")
+bearCol     = input.color(#F23645, "Bearish (LH / LL)",      group = "Colors")
+revBullCol  = input.color(color.new(#089981, 55), "Bullish Reversal Zone", group = "Colors")
+revBearCol  = input.color(color.new(#F23645, 55), "Bearish Reversal Zone", group = "Colors")
 
-//─────────────────────────────────────────────────────────────────────────────
-// PIVOT DETECTION
-// ta.pivothigh / ta.pivotlow confirm ONLY after `rightLen` bars have closed
-// beyond the pivot bar — the label is placed at the historical pivot bar and
-// will never move or disappear regardless of future price action.
-//─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// PIVOT DETECTION  (confirmed, zero repainting)
+// ta.pivothigh/pivotlow only fire after rightLen bars have closed past the
+// pivot bar. The label is drawn once at that historical bar index and never
+// moves or disappears regardless of future price action.
+// -----------------------------------------------------------------------------
 pivHigh = ta.pivothigh(high, leftLen, rightLen)
 pivLow  = ta.pivotlow( low,  leftLen, rightLen)
 
-// Confirmed bar index (rightLen bars in the past from current bar)
 confirmedBar = bar_index - rightLen
 
-//─────────────────────────────────────────────────────────────────────────────
-// STATE
-//─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// STATE  (var = persists across bars)
+// -----------------------------------------------------------------------------
 var float  lastHigh    = na
 var float  prevHigh    = na
 var int    lastHighBar = na
@@ -52,45 +51,42 @@ var int    lastLowBar  = na
 var int    prevLowBar  = na
 var string lastLowTag  = na
 
-// Per-bar alert flags (reset to false every bar — not var)
-bool isHH         = false
-bool isHL         = false
-bool isLH         = false
-bool isLL         = false
-bool bullReversal = false
-bool bearReversal = false
+// Per-bar flags -- no var, so they reset to false every bar
+isHH         = false
+isHL         = false
+isLH         = false
+isLL         = false
+bullReversal = false
+bearReversal = false
 
-//─────────────────────────────────────────────────────────────────────────────
-// PROCESS CONFIRMED PIVOT HIGHS
-//─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// CONFIRMED PIVOT HIGHS
+// -----------------------------------------------------------------------------
 if not na(pivHigh)
     prevHigh    := lastHigh
     prevHighBar := lastHighBar
     lastHigh    := pivHigh
     lastHighBar := confirmedBar
 
-    // HH if this high is above the previous high; LH otherwise
-    string tag   = na(prevHigh) or pivHigh >= prevHigh ? 'HH' : 'LH'
+    tag         = na(prevHigh) or pivHigh >= prevHigh ? "HH" : "LH"
     lastHighTag := tag
-    isHH         := tag == 'HH'
-    isLH         := tag == 'LH'
+    isHH        := tag == "HH"
+    isLH        := tag == "LH"
 
-    // Bearish reversal: a Lower High has formed while the last pivot low was a Higher Low
-    // Sequence  …HL → LH  means the uptrend stalled → potential bearish reversal
-    if tag == 'LH' and lastLowTag == 'HL'
+    // Bearish reversal: HL -> LH (uptrend stalling)
+    if tag == "LH" and lastLowTag == "HL"
         bearReversal := true
 
-    col = tag == 'HH' ? bullCol : bearCol
+    col = tag == "HH" ? bullCol : bearCol
 
     label.new(lastHighBar, pivHigh, tag,
-         xloc   = xloc.bar_index,
-         yloc   = yloc.price,
-         style  = label.style_label_down,
-         color  = color(na),
+         xloc      = xloc.bar_index,
+         yloc      = yloc.price,
+         style     = label.style_label_down,
+         color     = color.new(color.white, 100),
          textcolor = col,
-         size   = labelSz)
+         size      = labelSz)
 
-    // Line connecting this pivot high to the previous one
     if showLines and not na(prevHigh) and not na(prevHighBar)
         line.new(prevHighBar, prevHigh, lastHighBar, pivHigh,
              xloc  = xloc.bar_index,
@@ -98,37 +94,34 @@ if not na(pivHigh)
              style = line.style_solid,
              width = 1)
 
-//─────────────────────────────────────────────────────────────────────────────
-// PROCESS CONFIRMED PIVOT LOWS
-//─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// CONFIRMED PIVOT LOWS
+// -----------------------------------------------------------------------------
 if not na(pivLow)
     prevLow    := lastLow
     prevLowBar := lastLowBar
     lastLow    := pivLow
     lastLowBar := confirmedBar
 
-    // LL if this low is below the previous low; HL otherwise
-    string tag  = na(prevLow) or pivLow <= prevLow ? 'LL' : 'HL'
+    tag        = na(prevLow) or pivLow <= prevLow ? "LL" : "HL"
     lastLowTag := tag
-    isLL        := tag == 'LL'
-    isHL        := tag == 'HL'
+    isLL       := tag == "LL"
+    isHL       := tag == "HL"
 
-    // Bullish reversal: a Higher Low has formed while the last pivot high was a Lower High
-    // Sequence  …LH → HL  means the downtrend stalled → potential bullish reversal
-    if tag == 'HL' and lastHighTag == 'LH'
+    // Bullish reversal: LH -> HL (downtrend stalling)
+    if tag == "HL" and lastHighTag == "LH"
         bullReversal := true
 
-    col = tag == 'HL' ? bullCol : bearCol
+    col = tag == "HL" ? bullCol : bearCol
 
     label.new(lastLowBar, pivLow, tag,
          xloc      = xloc.bar_index,
          yloc      = yloc.price,
          style     = label.style_label_up,
-         color     = color(na),
+         color     = color.new(color.white, 100),
          textcolor = col,
          size      = labelSz)
 
-    // Line connecting this pivot low to the previous one
     if showLines and not na(prevLow) and not na(prevLowBar)
         line.new(prevLowBar, prevLow, lastLowBar, pivLow,
              xloc  = xloc.bar_index,
@@ -136,21 +129,19 @@ if not na(pivLow)
              style = line.style_solid,
              width = 1)
 
-//─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // REVERSAL ZONE MARKERS
-// A box is drawn around the reversal pivot candle and a label is placed.
-// Both are non-repainting — drawn once at pivot confirmation time.
-//─────────────────────────────────────────────────────────────────────────────
+// Drawn once at pivot confirmation -- non-repainting.
+// -----------------------------------------------------------------------------
 if showRevZone
     if bullReversal
-        // Highlight the HL candle that triggered the reversal
-        box.new(lastLowBar - 1, lastLow * (1 + 0.001),
-                lastLowBar + 1, lastLow * (1 - 0.001),
+        box.new(lastLowBar - 1, lastLow * 1.001,
+                lastLowBar + 1, lastLow * 0.999,
                 xloc         = xloc.bar_index,
                 bgcolor      = revBullCol,
                 border_color = color.new(bullCol, 20),
                 border_width = 1)
-        label.new(lastLowBar, lastLow, '▲  Bullish Reversal Zone',
+        label.new(lastLowBar, lastLow, "Bullish Reversal Zone",
              xloc      = xloc.bar_index,
              yloc      = yloc.price,
              style     = label.style_label_up,
@@ -159,14 +150,13 @@ if showRevZone
              size      = size.small)
 
     if bearReversal
-        // Highlight the LH candle that triggered the reversal
-        box.new(lastHighBar - 1, lastHigh * (1 + 0.001),
-                lastHighBar + 1, lastHigh * (1 - 0.001),
+        box.new(lastHighBar - 1, lastHigh * 1.001,
+                lastHighBar + 1, lastHigh * 0.999,
                 xloc         = xloc.bar_index,
                 bgcolor      = revBearCol,
                 border_color = color.new(bearCol, 20),
                 border_width = 1)
-        label.new(lastHighBar, lastHigh, '▼  Bearish Reversal Zone',
+        label.new(lastHighBar, lastHigh, "Bearish Reversal Zone",
              xloc      = xloc.bar_index,
              yloc      = yloc.price,
              style     = label.style_label_down,
@@ -174,17 +164,15 @@ if showRevZone
              textcolor = color.white,
              size      = size.small)
 
-//─────────────────────────────────────────────────────────────────────────────
-// ALERTS
-// All conditions are based on confirmed, non-repainting pivots.
-// Set alert to "Once Per Bar Close" in TradingView for best accuracy.
-//─────────────────────────────────────────────────────────────────────────────
-alertcondition(isHH,          'Higher High (HH)',       'HH confirmed — bullish swing high')
-alertcondition(isHL,          'Higher Low (HL)',        'HL confirmed — bullish support pivot')
-alertcondition(isLH,          'Lower High (LH)',        'LH confirmed — bearish resistance pivot')
-alertcondition(isLL,          'Lower Low (LL)',         'LL confirmed — bearish swing low')
-alertcondition(isHH or isHL,  'Bullish Structure',     'Bullish market structure event (HH or HL)')
-alertcondition(isLH or isLL,  'Bearish Structure',     'Bearish market structure event (LH or LL)')
-alertcondition(bullReversal,  'Bullish Reversal Zone', 'LH → HL sequence: potential bullish reversal')
-alertcondition(bearReversal,  'Bearish Reversal Zone', 'HL → LH sequence: potential bearish reversal')
-alertcondition(bullReversal or bearReversal, 'Any Reversal Zone', 'Market structure reversal zone detected')
+// -----------------------------------------------------------------------------
+// ALERTS  (set to "Once Per Bar Close" for strictest non-repainting guarantee)
+// -----------------------------------------------------------------------------
+alertcondition(isHH,                    "Higher High (HH)",       "HH confirmed - bullish swing high")
+alertcondition(isHL,                    "Higher Low (HL)",        "HL confirmed - bullish support pivot")
+alertcondition(isLH,                    "Lower High (LH)",        "LH confirmed - bearish resistance pivot")
+alertcondition(isLL,                    "Lower Low (LL)",         "LL confirmed - bearish swing low")
+alertcondition(isHH or isHL,            "Bullish Structure",      "Bullish market structure event (HH or HL)")
+alertcondition(isLH or isLL,            "Bearish Structure",      "Bearish market structure event (LH or LL)")
+alertcondition(bullReversal,            "Bullish Reversal Zone",  "LH to HL sequence: potential bullish reversal")
+alertcondition(bearReversal,            "Bearish Reversal Zone",  "HL to LH sequence: potential bearish reversal")
+alertcondition(bullReversal or bearReversal, "Any Reversal Zone", "Market structure reversal zone detected")
