@@ -1,0 +1,178 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © LuxAlgo
+
+//@version=6
+indicator(title="OTA S&D - High Strength MTF [Pro]", shorttitle="OTA S&D Pro", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// --- User-Defined Types ---
+type zone
+    box     boxId
+    line    tpLine
+    label   tpLabel
+    float   proximal
+    float   distal
+    float   tp
+    int     direction    // 1 for Demand, -1 for Supply
+    bool    mitigated
+    bool    retracedAlert // true after first retrace alert fires
+    int     createdBar    // bar_index at zone creation (prevents false retrace on formation bar)
+
+// --- Group: Zone Detection ---
+g1 = "Zone Detection"
+minScore     = input.int(8, "Min Zone Score (8-10)", minval=0, maxval=10, group=g1, tooltip="Only zones with this strength or higher will be shown.")
+lookback     = input.int(150, "Scan Lookback", group=g1)
+baseMaxBars  = input.int(4, "Max Base Candles", group=g1)
+rrRatio      = input.float(2.0, "Risk/Reward Ratio (TP)", minval=0.1, step=0.1, group=g1, tooltip="Calculates TP based on the zone's width.")
+
+// --- Group: Trend Filter ---
+g2 = "MTF Trend Filter"
+emaLen       = input.int(50, "Trend EMA Length", group=g2)
+check15m     = input.bool(true, "Check 15m Trend", group=g2)
+check1h      = input.bool(true, "Check 1h Trend", group=g2)
+check4h      = input.bool(true, "Check 4h Trend", group=g2)
+checkDaily   = input.bool(true, "Check Daily Trend", group=g2)
+
+// --- Trend Calculation ---
+f_get_trend_status(res) =>
+    [c, e] = request.security(syminfo.tickerid, res, [close, ta.ema(close, emaLen)])
+    c > e ? 1 : -1
+
+int t15 = check15m ? f_get_trend_status("15") : 0
+int t1h = check1h  ? f_get_trend_status("60") : 0
+int t4h = check4h  ? f_get_trend_status("240") : 0
+int tD  = checkDaily ? f_get_trend_status("D") : 0
+
+bool isBullishTrend = (not check15m or t15 == 1) and (not check1h or t1h == 1) and (not check4h or t4h == 1) and (not checkDaily or tD == 1)
+bool isBearishTrend = (not check15m or t15 == -1) and (not check1h or t1h == -1) and (not check4h or t4h == -1) and (not checkDaily or tD == -1)
+
+// --- S&D Core Logic ---
+f_isBoring(i) =>
+    r = high[i] - low[i]
+    b = math.abs(close[i] - open[i])
+    r > 0 and (b / r) <= 0.60
+
+f_isExplosive(i) =>
+    b = math.abs(close[i] - open[i])
+    a = ta.atr(14)[i]
+    not na(a) and b >= a * 1.5
+
+f_calculateScore(baseCount, legBody, avgBaseBody) =>
+    int score = 0
+    score += (baseCount <= 2 ? 4 : 2) // Base tightness
+    score += (legBody > avgBaseBody * 2.5 ? 4 : 2) // Momentum
+    score += 2 // Freshness
+    math.min(score, 10)
+
+// --- Tracking Array ---
+var zone[] activeZones = array.new<zone>()
+
+// --- Alert condition flags (reset each bar) ---
+var bool newDemandZone  = false
+var bool newSupplyZone  = false
+var bool demandRetrace  = false
+var bool supplyRetrace  = false
+
+newDemandZone := false
+newSupplyZone := false
+demandRetrace := false
+supplyRetrace := false
+
+// --- Cleanup & Mitigation Check ---
+if array.size(activeZones) > 0
+    for i = array.size(activeZones) - 1 to 0
+        zone z = array.get(activeZones, i)
+        bool m = false
+        // Demand Mitigation: Close below distal
+        if z.direction == 1 and close < z.distal
+            m := true
+        // Supply Mitigation: Close above distal
+        if z.direction == -1 and close > z.distal
+            m := true
+
+        if m
+            box.delete(z.boxId)
+            line.delete(z.tpLine)
+            label.delete(z.tpLabel)
+            array.remove(activeZones, i)
+
+// --- Retrace Detection (fires once per zone, only after the formation bar) ---
+if array.size(activeZones) > 0
+    for i = 0 to array.size(activeZones) - 1
+        zone z = array.get(activeZones, i)
+        if bar_index > z.createdBar and not z.retracedAlert
+            // Demand: price retraces down into the zone (close is between distal and proximal)
+            if z.direction == 1 and close <= z.proximal and close >= z.distal
+                z.retracedAlert := true
+                array.set(activeZones, i, z)
+                demandRetrace := true
+                alert("Price Retraced into Demand Zone – Potential Long Setup (" + syminfo.ticker + ")", alert.freq_once_per_bar)
+            // Supply: price retraces up into the zone (close is between proximal and distal)
+            if z.direction == -1 and close >= z.proximal and close <= z.distal
+                z.retracedAlert := true
+                array.set(activeZones, i, z)
+                supplyRetrace := true
+                alert("Price Retraced into Supply Zone – Potential Short Setup (" + syminfo.ticker + ")", alert.freq_once_per_bar)
+
+// --- Zone Identification ---
+if f_isExplosive(0)
+    int baseCount = 0
+    float bodyHigh = 0.0
+    float bodyLow = 10e10
+    float wickHigh = 0.0
+    float wickLow = 10e10
+    float totalBaseBody = 0.0
+
+    // Find Base
+    for i = 1 to baseMaxBars
+        if f_isBoring(i)
+            baseCount += 1
+            bodyHigh := math.max(bodyHigh, math.max(open[i], close[i]))
+            bodyLow  := math.min(bodyLow,  math.min(open[i], close[i]))
+            wickHigh := math.max(wickHigh, high[i])
+            wickLow  := math.min(wickLow,  low[i])
+            totalBaseBody += math.abs(close[i] - open[i])
+        else
+            break
+
+    if baseCount > 0
+        float avgBase = totalBaseBody / baseCount
+        int score = f_calculateScore(baseCount, math.abs(close - open), avgBase)
+
+        if score >= minScore
+            if close > open and isBullishTrend // Demand
+                float proximal = bodyHigh
+                float distal   = wickLow
+                float risk     = proximal - distal
+                float target   = proximal + (risk * rrRatio)
+
+                box b = box.new(bar_index[baseCount], proximal, bar_index, distal, bgcolor=color.new(#089981, 85), border_color=color.new(#089981, 40), extend=extend.right)
+                line t = line.new(bar_index, target, bar_index + 10, target, color=color.new(#089981, 50), style=line.style_dashed, extend=extend.right)
+                label l = label.new(bar_index + 15, target, "TP " + str.tostring(rrRatio) + "R: " + str.tostring(target, format.mintick), color=color.new(#000000, 100), textcolor=#089981, style=label.style_label_left, size=size.small)
+
+                array.push(activeZones, zone.new(b, t, l, proximal, distal, target, 1, false, false, bar_index))
+                newDemandZone := true
+                alert("New Demand Zone Formed (Score: " + str.tostring(score) + ")", alert.freq_once_per_bar)
+
+            else if close < open and isBearishTrend // Supply
+                float proximal = bodyLow
+                float distal   = wickHigh
+                float risk     = distal - proximal
+                float target   = proximal - (risk * rrRatio)
+
+                box b = box.new(bar_index[baseCount], distal, bar_index, proximal, bgcolor=color.new(#f23645, 85), border_color=color.new(#f23645, 40), extend=extend.right)
+                line t = line.new(bar_index, target, bar_index + 10, target, color=color.new(#f23645, 50), style=line.style_dashed, extend=extend.right)
+                label l = label.new(bar_index + 15, target, "TP " + str.tostring(rrRatio) + "R: " + str.tostring(target, format.mintick), color=color.new(#000000, 100), textcolor=#f23645, style=label.style_label_left, size=size.small)
+
+                array.push(activeZones, zone.new(b, t, l, proximal, distal, target, -1, false, false, bar_index))
+                newSupplyZone := true
+                alert("New Supply Zone Formed (Score: " + str.tostring(score) + ")", alert.freq_once_per_bar)
+
+// --- Alert Conditions (for TradingView alert dialog) ---
+alertcondition(newDemandZone, title="New Demand Zone Formed",
+     message="New Demand Zone Formed on {{ticker}} @ {{timenow}}")
+alertcondition(newSupplyZone, title="New Supply Zone Formed",
+     message="New Supply Zone Formed on {{ticker}} @ {{timenow}}")
+alertcondition(demandRetrace, title="Price Retraced into Demand Zone",
+     message="Price Retraced into Demand Zone – Potential Long Setup on {{ticker}}")
+alertcondition(supplyRetrace, title="Price Retraced into Supply Zone",
+     message="Price Retraced into Supply Zone – Potential Short Setup on {{ticker}}")
