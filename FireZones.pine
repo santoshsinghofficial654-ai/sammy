@@ -1,0 +1,299 @@
+//@version=5
+// =============================================================================
+//  FIRE ZONES - Strongest Intraday S/D + EARLY (Pre-Breakout) Detection
+//  Two detection engines:
+//    1. EARLY  = compression + volume absorption (catch BEFORE the big move)
+//    2. BREAKOUT = displacement candle confirmed by follow-through
+//  Non-repainting, optimized for 5m / 15m NSE charts.
+// =============================================================================
+indicator("FIRE ZONES + EARLY", shorttitle="FIRE+EARLY", overlay=true, max_boxes_count=300, max_lines_count=300, max_labels_count=300)
+
+// -----------------------------------------------------------------------------
+//  GLOBAL INPUTS
+// -----------------------------------------------------------------------------
+gG = "General"
+atrLen = input.int(14,  "ATR Length",         minval=2, group=gG)
+volLen = input.int(20,  "Volume SMA Length",  minval=2, group=gG)
+
+// -----------------------------------------------------------------------------
+//  EARLY MODE (Pre-Breakout / Loading Zone)
+// -----------------------------------------------------------------------------
+gE = "EARLY Mode (catch the move BEFORE it blasts)"
+useEarly      = input.bool(true,  "Enable EARLY Detection",                      group=gE)
+compressBars  = input.int(6,      "Compression Window (bars)",      minval=3, maxval=20, group=gE)
+compressMax   = input.float(0.8,  "Max Bar Range / ATR  (small candle)", minval=0.2, step=0.05, group=gE)
+absorbVol     = input.float(1.3,  "Min Bar Volume / SMA (absorption)",  minval=1.0, step=0.1, group=gE)
+minLoadCount  = input.int(3,      "Min Absorption Bars in Window",  minval=2, group=gE)
+biasLB        = input.int(20,     "Bias Lookback (for direction)",  minval=5, group=gE)
+
+// -----------------------------------------------------------------------------
+//  BREAKOUT MODE (post-displacement confirmation)
+// -----------------------------------------------------------------------------
+gB = "BREAKOUT Mode (confirmed strong moves)"
+useBreakout   = input.bool(true,  "Enable BREAKOUT Detection",                   group=gB)
+rangeMult     = input.float(1.5,  "Min Range x ATR",                minval=0.5, step=0.1, group=gB)
+volMult       = input.float(2.0,  "Min Volume x SMA",               minval=1.0, step=0.1, group=gB)
+bodyMin       = input.float(0.6,  "Min Body / Range",               minval=0.3, maxval=1.0, step=0.05, group=gB)
+confirmBars   = input.int(3,      "Confirmation Bars",              minval=1, maxval=10, group=gB)
+followThru    = input.float(1.0,  "Follow-Through x ATR",           minval=0.1, step=0.1, group=gB)
+sweepLookback = input.int(10,     "Liquidity Sweep Lookback",       minval=2, group=gB)
+requireSweep  = input.bool(true,  "Require Liquidity Sweep",        group=gB)
+
+// -----------------------------------------------------------------------------
+//  ZONE BEHAVIOUR
+// -----------------------------------------------------------------------------
+gZ = "Zone Behaviour"
+intradayOnly       = input.bool(true, "Intraday Only (auto-expire next day)", group=gZ)
+removeOnInvalidate = input.bool(true, "Remove on Invalidation",  group=gZ)
+extendRight        = input.bool(true, "Extend Zones Right",      group=gZ)
+maxZones           = input.int(8,    "Max Active Zones / Side", minval=1, maxval=20, group=gZ)
+showMid            = input.bool(true, "Show Mid-Zone Equilibrium",  group=gZ)
+
+// -----------------------------------------------------------------------------
+//  ALERTS
+// -----------------------------------------------------------------------------
+gA = "Alerts"
+alertNew   = input.bool(true, "Alert when New Zone Forms",    group=gA)
+alertTouch = input.bool(true, "Alert when Price Touches Zone", group=gA)
+
+// -----------------------------------------------------------------------------
+//  STYLE
+// -----------------------------------------------------------------------------
+gS = "Style"
+demFill    = input.color(color.new(#00ff88, 70), "Breakout Demand Fill",  group=gS)
+supFill    = input.color(color.new(#ff1744, 70), "Breakout Supply Fill",  group=gS)
+demEdge    = input.color(#00ff88, "Breakout Demand Border", group=gS)
+supEdge    = input.color(#ff1744, "Breakout Supply Border", group=gS)
+loadDemFill= input.color(color.new(#ffd54f, 70), "Loading Demand Fill",   group=gS)
+loadSupFill= input.color(color.new(#ff9100, 70), "Loading Supply Fill",   group=gS)
+loadDemEdge= input.color(#ffd54f, "Loading Demand Border", group=gS)
+loadSupEdge= input.color(#ff9100, "Loading Supply Border", group=gS)
+demTxt  = input.string("HEAVY BUYING",  "Breakout Demand Label", group=gS)
+supTxt  = input.string("HEAVY SELLING", "Breakout Supply Label", group=gS)
+loadDemTxt = input.string("LOADING - BUY READY", "Loading Demand Label", group=gS)
+loadSupTxt = input.string("LOADING - SELL READY","Loading Supply Label", group=gS)
+showLbl = input.bool(true, "Show Labels", group=gS)
+
+// -----------------------------------------------------------------------------
+//  CORE CALCS
+// -----------------------------------------------------------------------------
+atrV = ta.atr(atrLen)
+volA = ta.sma(volume, volLen)
+rng  = high - low
+body = math.abs(close - open)
+
+// -----------------------------------------------------------------------------
+//  EARLY DETECTION  (Compression + Absorption)
+// -----------------------------------------------------------------------------
+absorbBar = (rng > 0) and (rng <= atrV * compressMax) and (volume >= volA * absorbVol)
+
+int loadCount = 0
+if barstate.isconfirmed
+    for i = 0 to compressBars - 1
+        if absorbBar[i]
+            loadCount += 1
+
+int loadCountPrev = 0
+if barstate.isconfirmed
+    for i = 0 to compressBars - 1
+        if absorbBar[i + 1]
+            loadCountPrev += 1
+
+clusterTop = ta.highest(high, compressBars)
+clusterBot = ta.lowest(low,  compressBars)
+
+// Direction bias: cluster sitting at recent low = demand loading; at recent high = supply loading
+recentLow  = ta.lowest(low,  biasLB)
+recentHigh = ta.highest(high, biasLB)
+clusterMid = (clusterTop + clusterBot) / 2.0
+recentMid  = (recentLow + recentHigh) / 2.0
+
+newLoadingDem = useEarly and barstate.isconfirmed and loadCount >= minLoadCount and loadCountPrev < minLoadCount and clusterMid <= recentMid
+newLoadingSup = useEarly and barstate.isconfirmed and loadCount >= minLoadCount and loadCountPrev < minLoadCount and clusterMid >  recentMid
+
+// -----------------------------------------------------------------------------
+//  BREAKOUT DETECTION (delayed-confirmed displacement)
+// -----------------------------------------------------------------------------
+n = confirmBars
+
+isBullCand = (rng[n] > 0) and rng[n] >= atrV[n] * rangeMult and volume[n] >= volA[n] * volMult and body[n] >= rng[n] * bodyMin and close[n] > open[n]
+isBearCand = (rng[n] > 0) and rng[n] >= atrV[n] * rangeMult and volume[n] >= volA[n] * volMult and body[n] >= rng[n] * bodyMin and close[n] < open[n]
+
+priorLow  = ta.lowest(low,  sweepLookback)[n + 1]
+priorHigh = ta.highest(high, sweepLookback)[n + 1]
+sweepDem = (not requireSweep) or ((not na(priorLow))  and low[n]  < priorLow)
+sweepSup = (not requireSweep) or ((not na(priorHigh)) and high[n] > priorHigh)
+
+postHigh = ta.highest(high, n)
+postLow  = ta.lowest(low,  n)
+ftDem = postHigh > high[n] + atrV[n] * followThru
+ftSup = postLow  < low[n]  - atrV[n] * followThru
+
+newFireDem = useBreakout and barstate.isconfirmed and isBullCand and sweepDem and ftDem
+newFireSup = useBreakout and barstate.isconfirmed and isBearCand and sweepSup and ftSup
+
+// -----------------------------------------------------------------------------
+//  ZONE STORAGE
+// -----------------------------------------------------------------------------
+type FZ
+    box   bx
+    line  midL
+    label lbl
+    float top
+    float bot
+    int   created
+    bool  isDem
+    bool  isLoading
+    bool  touched
+    bool  alive
+
+var array<FZ> zones = array.new<FZ>()
+
+f_kill(FZ z) =>
+    box.delete(z.bx)
+    if not na(z.midL)
+        line.delete(z.midL)
+    if not na(z.lbl)
+        label.delete(z.lbl)
+    z.alive := false
+    z
+
+f_draw(bool _dem, bool _loading, float _top, float _bot, int _leftBar) =>
+    color fc = _loading ? (_dem ? loadDemFill : loadSupFill) : (_dem ? demFill : supFill)
+    color bc = _loading ? (_dem ? loadDemEdge : loadSupEdge) : (_dem ? demEdge : supEdge)
+    int   rightX = extendRight ? bar_index + 500 : bar_index + 30
+    box   bx = box.new(left=_leftBar, top=_top, right=rightX, bottom=_bot, border_color=bc, border_width=2, bgcolor=fc, extend=extendRight ? extend.right : extend.none)
+    float mid = (_top + _bot) / 2.0
+    line  ml = na
+    if showMid
+        ml := line.new(_leftBar, mid, rightX, mid, color=color.new(bc, 30), style=line.style_dotted, extend=extendRight ? extend.right : extend.none)
+    label lb = na
+    if showLbl
+        string txt = _loading ? (_dem ? loadDemTxt : loadSupTxt) : ("FIRE " + (_dem ? demTxt : supTxt))
+        lb := label.new(bar_index, _dem ? _bot : _top, txt, style=_dem ? label.style_label_up : label.style_label_down, color=color.new(bc, 0), textcolor=color.white, size=size.small)
+    FZ.new(bx, ml, lb, _top, _bot, bar_index, _dem, _loading, false, true)
+
+f_add(bool _dem, bool _loading, float _top, float _bot, int _leftBar) =>
+    FZ z = f_draw(_dem, _loading, _top, _bot, _leftBar)
+    array.push(zones, z)
+    int sc = 0
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            FZ zi = array.get(zones, i)
+            if zi.isDem == _dem and zi.alive
+                sc += 1
+    if sc > maxZones
+        bool removed = false
+        if array.size(zones) > 0
+            for i = 0 to array.size(zones) - 1
+                if not removed
+                    FZ zj = array.get(zones, i)
+                    if zj.isDem == _dem and zj.alive
+                        FZ killed = f_kill(zj)
+                        array.set(zones, i, killed)
+                        removed := true
+
+// -----------------------------------------------------------------------------
+//  CREATE ZONES
+// -----------------------------------------------------------------------------
+if newLoadingDem
+    f_add(true,  true,  clusterTop, clusterBot, bar_index - compressBars + 1)
+if newLoadingSup
+    f_add(false, true,  clusterTop, clusterBot, bar_index - compressBars + 1)
+
+if newFireDem
+    float topZ = math.max(open[n], close[n])
+    float botZ = math.min(open[n], low[n])
+    f_add(true,  false, topZ, botZ, bar_index - n)
+
+if newFireSup
+    float topZ = math.max(open[n], high[n])
+    float botZ = math.min(open[n], close[n])
+    f_add(false, false, topZ, botZ, bar_index - n)
+
+// -----------------------------------------------------------------------------
+//  ZONE MANAGEMENT
+// -----------------------------------------------------------------------------
+isNewDay = ta.change(time("D")) != 0
+bool demTouchAlert = false
+bool supTouchAlert = false
+bool demLoadTouchAlert = false
+bool supLoadTouchAlert = false
+
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        FZ z = array.get(zones, i)
+        if z.alive
+            bool expired = intradayOnly and isNewDay and bar_index > z.created
+            if expired
+                FZ killed = f_kill(z)
+                array.set(zones, i, killed)
+            else
+                bool inv = false
+                if z.isDem and close < z.bot
+                    inv := true
+                if (not z.isDem) and close > z.top
+                    inv := true
+                if inv
+                    if removeOnInvalidate
+                        FZ killed = f_kill(z)
+                        array.set(zones, i, killed)
+                    else
+                        box.set_bgcolor(z.bx, color.new(color.gray, 90))
+                        box.set_border_color(z.bx, color.new(color.gray, 60))
+                        if not na(z.midL)
+                            line.delete(z.midL)
+                            z.midL := na
+                        z.alive := false
+                        array.set(zones, i, z)
+                else
+                    bool touchNow = false
+                    if z.isDem and low <= z.top and high >= z.bot
+                        touchNow := true
+                    if (not z.isDem) and high >= z.bot and low <= z.top
+                        touchNow := true
+                    if touchNow and (not z.touched)
+                        z.touched := true
+                        if z.isLoading and z.isDem
+                            demLoadTouchAlert := true
+                        if z.isLoading and (not z.isDem)
+                            supLoadTouchAlert := true
+                        if (not z.isLoading) and z.isDem
+                            demTouchAlert := true
+                        if (not z.isLoading) and (not z.isDem)
+                            supTouchAlert := true
+                        array.set(zones, i, z)
+
+// -----------------------------------------------------------------------------
+//  ALERTS
+// -----------------------------------------------------------------------------
+if alertNew and newLoadingDem
+    alert("LOADING DEMAND Zone Forming - Buyers Loading, Big Move Up Possible", alert.freq_once_per_bar)
+if alertNew and newLoadingSup
+    alert("LOADING SUPPLY Zone Forming - Sellers Loading, Big Move Down Possible", alert.freq_once_per_bar)
+if alertNew and newFireDem
+    alert("FIRE Demand Zone Formed - Heavy Buying Confirmed", alert.freq_once_per_bar)
+if alertNew and newFireSup
+    alert("FIRE Supply Zone Formed - Heavy Selling Confirmed", alert.freq_once_per_bar)
+
+if alertTouch and demLoadTouchAlert
+    alert("LOADING BUY ZONE TOUCHED - Big Move UP Imminent", alert.freq_once_per_bar)
+if alertTouch and supLoadTouchAlert
+    alert("LOADING SELL ZONE TOUCHED - Big Move DOWN Imminent", alert.freq_once_per_bar)
+if alertTouch and demTouchAlert
+    alert("FIRE BUY ZONE TOUCHED - Expect Strong Move UP", alert.freq_once_per_bar)
+if alertTouch and supTouchAlert
+    alert("FIRE SELL ZONE TOUCHED - Expect Strong Move DOWN", alert.freq_once_per_bar)
+
+alertcondition(newLoadingDem,      title="New Loading Demand",   message="LOADING DEMAND Zone Forming - Buyers Loading, Big Move Up Possible")
+alertcondition(newLoadingSup,      title="New Loading Supply",   message="LOADING SUPPLY Zone Forming - Sellers Loading, Big Move Down Possible")
+alertcondition(newFireDem,         title="New Fire Demand",      message="FIRE Demand Zone Formed - Heavy Buying Confirmed")
+alertcondition(newFireSup,         title="New Fire Supply",      message="FIRE Supply Zone Formed - Heavy Selling Confirmed")
+alertcondition(demLoadTouchAlert,  title="Loading Demand Touch", message="LOADING BUY ZONE TOUCHED - Big Move UP Imminent")
+alertcondition(supLoadTouchAlert,  title="Loading Supply Touch", message="LOADING SELL ZONE TOUCHED - Big Move DOWN Imminent")
+alertcondition(demTouchAlert,      title="Fire Demand Touch",    message="FIRE BUY ZONE TOUCHED - Expect Strong Move UP")
+alertcondition(supTouchAlert,      title="Fire Supply Touch",    message="FIRE SELL ZONE TOUCHED - Expect Strong Move DOWN")
+
+// =============================================================================
+//  END
+// =============================================================================

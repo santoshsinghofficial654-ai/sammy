@@ -1,0 +1,296 @@
+//@version=5
+// =============================================================================
+//  AI BUY/SELL - Early Blast Detector (Intraday)
+//  Multi-factor confluence engine that flags BUY/SELL when small candles
+//  show institutional accumulation/distribution and are ready to blast.
+//  10-factor scoring system - signal fires when score crosses threshold.
+//  Non-repainting (signals on confirmed bar close, no future referencing).
+// =============================================================================
+indicator("AI BUY/SELL - Early Blast Detector", shorttitle="AI BUY/SELL", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+// -----------------------------------------------------------------------------
+//  INPUTS
+// -----------------------------------------------------------------------------
+gC = "AI Detection Engine"
+compressBars = input.int(8,    "Compression Window (bars)",    minval=3, maxval=20, group=gC)
+compressATR  = input.float(0.75,"Max Avg Range / ATR (small candles)", minval=0.2, step=0.05, group=gC)
+absorbVol    = input.float(1.15,"Min Avg Volume / SMA (absorption)",   minval=1.0, step=0.05, group=gC)
+emaFastLen   = input.int(20,   "Fast EMA",                     minval=5, group=gC)
+emaSlowLen   = input.int(50,   "Slow EMA",                     minval=10, group=gC)
+rsiLen       = input.int(14,   "RSI Length",                   minval=2, group=gC)
+useMACD      = input.bool(true,"Factor: MACD Histogram",       group=gC)
+useOBV       = input.bool(true,"Factor: OBV Trend",            group=gC)
+useBB        = input.bool(true,"Factor: Bollinger Squeeze",    group=gC)
+bbLen        = input.int(20,   "BB / Squeeze Length",          minval=5, group=gC)
+bbMult       = input.float(2.0,"BB Mult",                      minval=1.0, step=0.1, group=gC)
+useADX       = input.bool(true,"Factor: ADX Trend Building",   group=gC)
+adxLen       = input.int(14,   "ADX Length",                   minval=2, group=gC)
+minScore     = input.int(6,    "Minimum AI Score (1-10) to Trigger", minval=3, maxval=10, group=gC)
+cooldown     = input.int(5,    "Cooldown Bars Between Signals", minval=0, group=gC)
+
+gR = "Risk Management"
+atrLen   = input.int(14,   "ATR Length",          minval=2, group=gR)
+slMult   = input.float(1.0,"SL x ATR",            minval=0.2, step=0.1, group=gR)
+rr1      = input.float(1.0,"TP1 R:R",             minval=0.5, step=0.5, group=gR)
+rr2      = input.float(2.0,"TP2 R:R",             minval=0.5, step=0.5, group=gR)
+rr3      = input.float(3.0,"TP3 R:R",             minval=0.5, step=0.5, group=gR)
+
+gV = "Visuals"
+showSLTP    = input.bool(true, "Show SL / TP Lines", group=gV)
+showLabels  = input.bool(true, "Show Price Labels",  group=gV)
+extendBars  = input.int(40,   "Extend Lines Right",  minval=5, group=gV)
+showScore   = input.bool(true, "Show Live AI Score on Last Bar", group=gV)
+showEMAs    = input.bool(true, "Show Trend EMAs",    group=gV)
+
+gA = "Alerts"
+trackActive = input.bool(true, "Track Trade & Fire SL/TP Alerts", group=gA)
+
+// -----------------------------------------------------------------------------
+//  CALCULATIONS
+// -----------------------------------------------------------------------------
+atrV = ta.atr(atrLen)
+volA = ta.sma(volume, 20)
+emaF = ta.ema(close, emaFastLen)
+emaS = ta.ema(close, emaSlowLen)
+rsiV = ta.rsi(close, rsiLen)
+
+[macdLine, sigLine, hist] = ta.macd(close, 12, 26, 9)
+
+obv = ta.cum(math.sign(ta.change(close)) * volume)
+
+basis      = ta.sma(close, bbLen)
+dev        = bbMult * ta.stdev(close, bbLen)
+upperBB    = basis + dev
+lowerBB    = basis - dev
+bbWidth    = upperBB - lowerBB
+bbWidthMA  = ta.sma(bbWidth, bbLen)
+bbSqueeze  = bbWidth < bbWidthMA
+
+[diPlus, diMinus, adxV] = ta.dmi(adxLen, adxLen)
+
+rng       = high - low
+avgRng    = ta.sma(rng, compressBars)
+avgVol    = ta.sma(volume, compressBars)
+isComp    = avgRng <= atrV * compressATR
+isAbsorb  = avgVol >= volA * absorbVol
+
+// Higher lows / lower highs structure
+hlNow  = ta.lowest(low, 3)
+hlPrev = ta.lowest(low, 3)[3]
+lhNow  = ta.highest(high, 3)
+lhPrev = ta.highest(high, 3)[3]
+higherLows  = hlNow > hlPrev
+lowerHighs  = lhNow < lhPrev
+
+// -----------------------------------------------------------------------------
+//  10-FACTOR AI SCORING
+// -----------------------------------------------------------------------------
+//  BUY factors (score 0..10)
+b1  = isComp                                                   // 1. Compression
+b2  = isAbsorb                                                 // 2. Volume absorption
+b3  = higherLows                                               // 3. Structure: higher lows
+b4  = close > emaF                                             // 4. Above fast EMA
+b5  = emaF > emaS                                              // 5. Fast EMA > Slow EMA
+b6  = rsiV > 45 and rsiV < 70                                  // 6. RSI in bull zone
+b7  = (not useMACD) or hist > hist[1]                          // 7. MACD hist rising
+b8  = (not useOBV)  or obv > obv[3]                            // 8. OBV rising (accumulation)
+b9  = (not useBB)   or bbSqueeze                               // 9. BB squeeze (volatility contraction)
+b10 = (not useADX)  or (adxV > adxV[3] and diPlus > diMinus)   // 10. ADX building / +DI dominant
+
+int buyScore = (b1?1:0) + (b2?1:0) + (b3?1:0) + (b4?1:0) + (b5?1:0) + (b6?1:0) + (b7?1:0) + (b8?1:0) + (b9?1:0) + (b10?1:0)
+
+// SELL factors (mirror)
+s1  = isComp
+s2  = isAbsorb
+s3  = lowerHighs
+s4  = close < emaF
+s5  = emaF < emaS
+s6  = rsiV < 55 and rsiV > 30
+s7  = (not useMACD) or hist < hist[1]
+s8  = (not useOBV)  or obv < obv[3]
+s9  = (not useBB)   or bbSqueeze
+s10 = (not useADX)  or (adxV > adxV[3] and diMinus > diPlus)
+
+int sellScore = (s1?1:0) + (s2?1:0) + (s3?1:0) + (s4?1:0) + (s5?1:0) + (s6?1:0) + (s7?1:0) + (s8?1:0) + (s9?1:0) + (s10?1:0)
+
+// -----------------------------------------------------------------------------
+//  SIGNAL TRIGGER (rising-edge crossover of threshold)
+// -----------------------------------------------------------------------------
+var int lastBuyBar  = -10000
+var int lastSellBar = -10000
+
+bool buyCross  = buyScore  >= minScore and buyScore[1]  < minScore
+bool sellCross = sellScore >= minScore and sellScore[1] < minScore
+
+isBuy  = barstate.isconfirmed and buyCross  and (bar_index - lastBuyBar)  >= cooldown
+isSell = barstate.isconfirmed and sellCross and (bar_index - lastSellBar) >= cooldown
+
+if isBuy
+    lastBuyBar := bar_index
+if isSell
+    lastSellBar := bar_index
+
+// -----------------------------------------------------------------------------
+//  TRADE PLAN
+// -----------------------------------------------------------------------------
+slBuy  = close - atrV * slMult
+slSell = close + atrV * slMult
+riskBuy  = close - slBuy
+riskSell = slSell - close
+
+tp1Buy  = close + riskBuy * rr1
+tp2Buy  = close + riskBuy * rr2
+tp3Buy  = close + riskBuy * rr3
+tp1Sell = close - riskSell * rr1
+tp2Sell = close - riskSell * rr2
+tp3Sell = close - riskSell * rr3
+
+// -----------------------------------------------------------------------------
+//  PLOT SIGNALS
+// -----------------------------------------------------------------------------
+plotshape(isBuy,  "BUY",  style=shape.labelup,   location=location.belowbar, color=color.new(#00e676, 0), text="AI BUY",  textcolor=color.white, size=size.normal)
+plotshape(isSell, "SELL", style=shape.labeldown, location=location.abovebar, color=color.new(#ff1744, 0), text="AI SELL", textcolor=color.white, size=size.normal)
+
+f_drawTrade(bool _short, float _entry, float _sl, float _tp1, float _tp2, float _tp3) =>
+    color slC = color.new(#ff1744, 0)
+    color tpC = color.new(#00e676, 0)
+    color enC = color.new(#ffeb3b, 0)
+    int   rX  = bar_index + extendBars
+    line.new(bar_index, _entry, rX, _entry, color=enC, width=2)
+    line.new(bar_index, _sl,    rX, _sl,    color=slC, width=2)
+    line.new(bar_index, _tp1,   rX, _tp1,   color=tpC, style=line.style_dashed)
+    line.new(bar_index, _tp2,   rX, _tp2,   color=tpC, style=line.style_dashed)
+    line.new(bar_index, _tp3,   rX, _tp3,   color=tpC, style=line.style_dashed)
+    if showLabels
+        string side = _short ? "SELL" : "BUY"
+        label.new(rX, _entry, side + " " + str.tostring(_entry, "#.##"), color=enC, textcolor=color.black, style=label.style_label_left, size=size.small)
+        label.new(rX, _sl,    "SL "  + str.tostring(_sl,    "#.##"), color=slC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(rX, _tp1,   "TP1 " + str.tostring(_tp1,   "#.##"), color=tpC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(rX, _tp2,   "TP2 " + str.tostring(_tp2,   "#.##"), color=tpC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(rX, _tp3,   "TP3 " + str.tostring(_tp3,   "#.##"), color=tpC, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+if isBuy and showSLTP
+    f_drawTrade(false, close, slBuy,  tp1Buy,  tp2Buy,  tp3Buy)
+if isSell and showSLTP
+    f_drawTrade(true,  close, slSell, tp1Sell, tp2Sell, tp3Sell)
+
+// -----------------------------------------------------------------------------
+//  LIVE SCORE LABEL
+// -----------------------------------------------------------------------------
+var label scoreLbl = label.new(na, na, "", style=label.style_label_left, color=color.new(color.gray, 30), textcolor=color.white, size=size.small)
+if showScore and barstate.islast
+    string txt = "AI SCORE\nBUY:  " + str.tostring(buyScore) + "/10\nSELL: " + str.tostring(sellScore) + "/10\nThreshold: " + str.tostring(minScore)
+    label.set_xy(scoreLbl, bar_index + 5, close)
+    label.set_text(scoreLbl, txt)
+
+// -----------------------------------------------------------------------------
+//  TRADE TRACKING (SL / TP hit alerts)
+// -----------------------------------------------------------------------------
+var float aLongEntry  = na
+var float aLongSL     = na
+var float aLongTP1    = na
+var float aLongTP2    = na
+var float aLongTP3    = na
+var bool  aLongTP1Hit = false
+var bool  aLongTP2Hit = false
+var float aShortEntry = na
+var float aShortSL    = na
+var float aShortTP1   = na
+var float aShortTP2   = na
+var float aShortTP3   = na
+var bool  aShortTP1Hit= false
+var bool  aShortTP2Hit= false
+
+if isBuy
+    aLongEntry  := close
+    aLongSL     := slBuy
+    aLongTP1    := tp1Buy
+    aLongTP2    := tp2Buy
+    aLongTP3    := tp3Buy
+    aLongTP1Hit := false
+    aLongTP2Hit := false
+if isSell
+    aShortEntry := close
+    aShortSL    := slSell
+    aShortTP1   := tp1Sell
+    aShortTP2   := tp2Sell
+    aShortTP3   := tp3Sell
+    aShortTP1Hit:= false
+    aShortTP2Hit:= false
+
+bool longSLHit  = trackActive and (not na(aLongEntry))  and low  <= aLongSL
+bool longTP1Hit = trackActive and (not na(aLongEntry))  and (not aLongTP1Hit) and high >= aLongTP1
+bool longTP2Hit = trackActive and (not na(aLongEntry))  and (not aLongTP2Hit) and high >= aLongTP2
+bool longTP3Hit = trackActive and (not na(aLongEntry))  and high >= aLongTP3
+bool shortSLHit = trackActive and (not na(aShortEntry)) and high >= aShortSL
+bool shortTP1Hit= trackActive and (not na(aShortEntry)) and (not aShortTP1Hit) and low  <= aShortTP1
+bool shortTP2Hit= trackActive and (not na(aShortEntry)) and (not aShortTP2Hit) and low  <= aShortTP2
+bool shortTP3Hit= trackActive and (not na(aShortEntry)) and low  <= aShortTP3
+
+if longTP1Hit
+    aLongTP1Hit := true
+if longTP2Hit
+    aLongTP2Hit := true
+if shortTP1Hit
+    aShortTP1Hit := true
+if shortTP2Hit
+    aShortTP2Hit := true
+
+if longSLHit or longTP3Hit
+    aLongEntry := na
+    aLongSL    := na
+    aLongTP1   := na
+    aLongTP2   := na
+    aLongTP3   := na
+if shortSLHit or shortTP3Hit
+    aShortEntry := na
+    aShortSL    := na
+    aShortTP1   := na
+    aShortTP2   := na
+    aShortTP3   := na
+
+// -----------------------------------------------------------------------------
+//  ALERTS
+// -----------------------------------------------------------------------------
+if isBuy
+    alert("AI BUY SIGNAL - Score " + str.tostring(buyScore) + "/10 | Entry " + str.tostring(close, "#.##") + " | SL " + str.tostring(slBuy, "#.##") + " | TP1 " + str.tostring(tp1Buy, "#.##") + " | TP2 " + str.tostring(tp2Buy, "#.##") + " | TP3 " + str.tostring(tp3Buy, "#.##"), alert.freq_once_per_bar)
+if isSell
+    alert("AI SELL SIGNAL - Score " + str.tostring(sellScore) + "/10 | Entry " + str.tostring(close, "#.##") + " | SL " + str.tostring(slSell, "#.##") + " | TP1 " + str.tostring(tp1Sell, "#.##") + " | TP2 " + str.tostring(tp2Sell, "#.##") + " | TP3 " + str.tostring(tp3Sell, "#.##"), alert.freq_once_per_bar)
+
+if longTP1Hit
+    alert("BUY TP1 HIT (1R) - Move SL to Entry", alert.freq_once_per_bar)
+if longTP2Hit
+    alert("BUY TP2 HIT (2R) - Trail SL", alert.freq_once_per_bar)
+if longTP3Hit
+    alert("BUY TP3 HIT (3R) - Full Profit", alert.freq_once_per_bar)
+if longSLHit
+    alert("BUY STOP-LOSS HIT", alert.freq_once_per_bar)
+if shortTP1Hit
+    alert("SELL TP1 HIT (1R) - Move SL to Entry", alert.freq_once_per_bar)
+if shortTP2Hit
+    alert("SELL TP2 HIT (2R) - Trail SL", alert.freq_once_per_bar)
+if shortTP3Hit
+    alert("SELL TP3 HIT (3R) - Full Profit", alert.freq_once_per_bar)
+if shortSLHit
+    alert("SELL STOP-LOSS HIT", alert.freq_once_per_bar)
+
+alertcondition(isBuy,        title="AI BUY",      message="AI BUY SIGNAL - Early Blast Detected")
+alertcondition(isSell,       title="AI SELL",     message="AI SELL SIGNAL - Early Blast Detected")
+alertcondition(longTP1Hit,   title="Buy TP1",     message="BUY TP1 HIT")
+alertcondition(longTP2Hit,   title="Buy TP2",     message="BUY TP2 HIT")
+alertcondition(longTP3Hit,   title="Buy TP3",     message="BUY TP3 HIT")
+alertcondition(longSLHit,    title="Buy SL",      message="BUY STOP-LOSS HIT")
+alertcondition(shortTP1Hit,  title="Sell TP1",    message="SELL TP1 HIT")
+alertcondition(shortTP2Hit,  title="Sell TP2",    message="SELL TP2 HIT")
+alertcondition(shortTP3Hit,  title="Sell TP3",    message="SELL TP3 HIT")
+alertcondition(shortSLHit,   title="Sell SL",     message="SELL STOP-LOSS HIT")
+
+// -----------------------------------------------------------------------------
+//  TREND EMAS
+// -----------------------------------------------------------------------------
+plot(showEMAs ? emaF : na, "Fast EMA", color=color.new(color.yellow, 0), linewidth=1)
+plot(showEMAs ? emaS : na, "Slow EMA", color=color.new(color.aqua,   0), linewidth=1)
+
+// =============================================================================
+//  END
+// =============================================================================
